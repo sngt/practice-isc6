@@ -25,6 +25,11 @@ function config($key) {
 }
 
 $container = new class extends \Slim\Container {
+    private static $ENTRIES = [];
+
+    private static $CHAR_LENGTH_ENTRY_MAP = [];
+    private static $ENTRIES_BY_CHAR_LENGTH = [];
+
     public $dbh;
     public function __construct() {
         parent::__construct();
@@ -37,13 +42,91 @@ $container = new class extends \Slim\Container {
         ));
     }
 
+    public function initialize() {
+        apcu_clear_cache();
+        $this->get_entries();
+    }
+
+    public function get_entry($keyword) {
+        $entries = $this->get_entries();
+        if (isset($entries[$keyword])) {
+            return $entries[$keyword];
+        }
+        return null;
+    }
+
+    public function set_entry($entry) {
+        $keyword = $entry['keyword'];
+        $this->delete_entry($keyword);
+
+        self::$ENTRIES[$keyword] = $entry;
+        self::$CHAR_LENGTH_ENTRY_MAP[$keyword][$keyword] = $entry;
+
+        apcu_store('entries', self::$ENTRIES);
+    }
+
+    public function delete_entry($keyword) {
+        if (empty($this->get_entry($keyword))) {
+            return false;
+        }
+
+        unset(self::$ENTRIES[$keyword]);
+        unset(self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword]);
+        if (self::$ENTRIES_BY_CHAR_LENGTH) {
+            self::$ENTRIES_BY_CHAR_LENGTH = [];
+        }
+
+        apcu_store('entries', self::$ENTRIES);
+        return true;
+    }
+
+    public function get_entries() {
+        if (self::$ENTRIES) {
+            return $ENTRIES;
+        }
+
+        self::$ENTRIES = apcu_fetch('entries');
+        if (empty(self::$ENTRIES)) {
+            $entries = $this->dbh->select_all(
+                'SELECT * FROM entry ORDER BY updated_at DESC'
+            );
+            foreach ($entries as $entry) {
+                $keyword = $entry['keyword'];
+                self::$ENTRIES[$keyword] = $entry;
+            }
+            apcu_store('entries', self::$ENTRIES);
+        }
+
+        foreach (self::$ENTRIES as $keyword => $entry) {
+            self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword] = $entry;
+        }
+
+        return self::$ENTRIES;
+    }
+
+    public function get_entries_sorted_by_char_length() {
+        if (empty(self::$ENTRIES_BY_CHAR_LENGTH)) {
+            if (empty(self::$CHAR_LENGTH_ENTRY_MAP)) {
+                foreach ($this->get_entry() as $keyword => $entry) {
+                    self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword] = $entry;
+                }
+            }
+            krsort(self::$CHAR_LENGTH_ENTRY_MAP);
+            foreach (self::$CHAR_LENGTH_ENTRY_MAP as $entries) {
+                self::$ENTRIES_BY_CHAR_LENGTH = array_merge(self::$ENTRIES_BY_CHAR_LENGTH, $entries);
+            }
+        }
+        return self::$ENTRIES_BY_CHAR_LENGTH;
+    }
+
     public function htmlify($content) {
         if (!isset($content)) {
             return '';
         }
-        $keywords = $this->dbh->select_all(
-            'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
-        );
+        // $keywords = $this->dbh->select_all(
+        //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
+        // );
+        $keywords = $this->get_entries_sorted_by_char_length();
         $kw2sha = [];
 
         // NOTE: avoid pcre limitation "regular expression is too large at offset"
@@ -110,11 +193,11 @@ $mw['authenticate'] = function ($req, $c, $next) {
     return $next($req, $c);
 };
 
-$app->get('/initialize', function (Request $req, Response $c) {
+$app->get('/initialize', function (Request $req, Response $c) use($container) {
     $this->dbh->query(
         'DELETE FROM entry WHERE id > 7101'
     );
-apcu_clear_cache();
+    $container->initialize();
     $origin = config('isutar_origin');
     $url = "$origin/initialize";
     file_get_contents($url);
@@ -123,26 +206,30 @@ apcu_clear_cache();
     ]);
 });
 
-$app->get('/', function (Request $req, Response $c) {
+$app->get('/', function (Request $req, Response $c) use($container) {
     $PER_PAGE = 10;
     $page = $req->getQueryParams()['page'] ?? 1;
 
-    $offset = $PER_PAGE * ($page-1);
-    $entries = $this->dbh->select_all(
-        'SELECT * FROM entry '.
-        'ORDER BY updated_at DESC '.
-        "LIMIT $PER_PAGE ".
-        "OFFSET $offset"
-    );
+    // $offset = $PER_PAGE * ($page-1);
+    // $entries = $this->dbh->select_all(
+    //     'SELECT * FROM entry '.
+    //     'ORDER BY updated_at DESC '.
+    //     "LIMIT $PER_PAGE ".
+    //     "OFFSET $offset"
+    // );
+    $all_entries = $container->get_entries();
+    $total_entries = count($all_entries);
+    $offset = ($total_entries - 1) - ($page * $PER_PAGE);
+    $entries = array_slice($all_entries, $offset, $PER_PAGE);
     foreach ($entries as &$entry) {
         $entry['html']  = $this->htmlify($entry['description']);
         $entry['stars'] = $this->load_stars($entry['keyword']);
     }
     unset($entry);
 
-    $total_entries = $this->dbh->select_one(
-        'SELECT COUNT(*) FROM entry'
-    );
+    // $total_entries = $this->dbh->select_one(
+    //     'SELECT COUNT(*) FROM entry'
+    // );
     $last_page = ceil($total_entries / $PER_PAGE);
     $pages = range(max(1, $page-5), min($last_page, $page+5));
 
@@ -153,7 +240,7 @@ $app->get('/robots.txt', function (Request $req, Response $c) {
     return $c->withStatus(404);
 });
 
-$app->post('/keyword', function (Request $req, Response $c) {
+$app->post('/keyword', function (Request $req, Response $c) use($container) {
     $keyword = $req->getParsedBody()['keyword'];
     if (!isset($keyword)) {
         return $c->withStatus(400)->write("'keyword' required");
@@ -164,12 +251,17 @@ $app->post('/keyword', function (Request $req, Response $c) {
     if (is_spam_contents($description) || is_spam_contents($keyword)) {
         return $c->withStatus(400)->write('SPAM!');
     }
-    $this->dbh->query(
-        'INSERT INTO entry (author_id, keyword, description, created_at, updated_at)'
-        .' VALUES (?, ?, ?, NOW(), NOW())'
-        .' ON DUPLICATE KEY UPDATE'
-        .' author_id = ?, keyword = ?, description = ?, updated_at = NOW()'
-    , $user_id, $keyword, $description, $user_id, $keyword, $description);
+    $container->set_entry([
+        'author_id' => $user_id,
+        'keyword' => $keyword,
+        'description' => $description
+    ]);
+    // $this->dbh->query(
+    //     'INSERT INTO entry (author_id, keyword, description, created_at, updated_at)'
+    //     .' VALUES (?, ?, ?, NOW(), NOW())'
+    //     .' ON DUPLICATE KEY UPDATE'
+    //     .' author_id = ?, keyword = ?, description = ?, updated_at = NOW()'
+    // , $user_id, $keyword, $description, $user_id, $keyword, $description);
 
     return $c->withRedirect('/');
 })->add($mw['authenticate'])->add($mw['set_name']);
@@ -232,14 +324,15 @@ $app->get('/logout', function (Request $req, Response $c) {
     return $c->withRedirect('/');
 });
 
-$app->get('/keyword/{keyword}', function (Request $req, Response $c) {
+$app->get('/keyword/{keyword}', function (Request $req, Response $c) use($container) {
     $keyword = $req->getAttribute('keyword');
     if ($keyword === null) return $c->withStatus(400);
 
-    $entry = $this->dbh->select_row(
-        'SELECT * FROM entry'
-        .' WHERE keyword = ?'
-    , $keyword);
+    // $entry = $this->dbh->select_row(
+    //     'SELECT * FROM entry'
+    //     .' WHERE keyword = ?'
+    // , $keyword);
+    $entry = $container->get_entry($keyword);
     if (empty($entry)) return $c->withStatus(404);
     $entry['html'] = $this->htmlify($entry['description']);
     $entry['stars'] = $this->load_stars($entry['keyword']);
@@ -249,19 +342,22 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) {
     ]);
 })->add($mw['set_name']);
 
-$app->post('/keyword/{keyword}', function (Request $req, Response $c) {
+$app->post('/keyword/{keyword}', function (Request $req, Response $c) use($container) {
     $keyword = $req->getAttribute('keyword');
     if ($keyword === null) return $c->withStatus(400);
     $delete = $req->getParsedBody()['delete'];
     if ($delete === null) return $c->withStatus(400);
 
-    $entry = $this->dbh->select_row(
-        'SELECT * FROM entry'
-        .' WHERE keyword = ?'
-    , $keyword);
-    if (empty($entry)) return $c->withStatus(404);
-
-    $this->dbh->query('DELETE FROM entry WHERE keyword = ?', $keyword);
+    // $entry = $this->dbh->select_row(
+    //     'SELECT * FROM entry'
+    //     .' WHERE keyword = ?'
+    // , $keyword);
+    // if (empty($entry)) return $c->withStatus(404);
+    //
+    // $this->dbh->query('DELETE FROM entry WHERE keyword = ?', $keyword);
+    if ($container->delete_entry($keyword) !== true) {
+        return $c->withStatus(404);
+    }
     return $c->withRedirect('/');
 })->add($mw['authenticate'])->add($mw['set_name']);
 
