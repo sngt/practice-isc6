@@ -30,6 +30,8 @@ $container = new class extends \Slim\Container {
     private static $CHAR_LENGTH_ENTRY_MAP = [];
     private static $ENTRIES_BY_CHAR_LENGTH = [];
 
+    private static $STARS = [];
+
     public $dbh;
     public function __construct() {
         parent::__construct();
@@ -49,6 +51,7 @@ $container = new class extends \Slim\Container {
     public function initialize() {
         apcu_clear_cache();
         $this->get_entries();
+        self::$STARS = [];
     }
 
     public function get_entry($keyword) {
@@ -63,19 +66,19 @@ $container = new class extends \Slim\Container {
         $keyword = $entry['keyword'];
         $this->delete_entry($keyword);
 
-        $this->lock();
+        $this->lock('entry');
         try {
             self::$ENTRIES[$keyword] = $entry;
             self::$CHAR_LENGTH_ENTRY_MAP[$keyword][$keyword] = $entry;
 
             apcu_store('entries', self::$ENTRIES);
         } finally {
-            $this->unlock();
+            $this->unlock('entry');
         }
     }
 
     public function delete_entry($keyword) {
-        $this->lock();
+        $this->lock('entry');
         try {
             if (empty($this->get_entry($keyword))) {
                 return false;
@@ -89,7 +92,7 @@ $container = new class extends \Slim\Container {
 
             apcu_store('entries', self::$ENTRIES);
         } finally {
-            $this->unlock();
+            $this->unlock('entry');
         }
         return true;
     }
@@ -101,14 +104,19 @@ $container = new class extends \Slim\Container {
 
         self::$ENTRIES = apcu_fetch('entries');
         if (empty(self::$ENTRIES)) {
-            $entries = $this->dbh->select_all(
-                'SELECT * FROM entry ORDER BY updated_at DESC'
-            );
-            foreach ($entries as $entry) {
-                $keyword = $entry['keyword'];
-                self::$ENTRIES[$keyword] = $entry;
+            $this->lock('entry');
+            try {
+                $entries = $this->dbh->select_all(
+                    'SELECT * FROM entry ORDER BY updated_at DESC'
+                );
+                foreach ($entries as $entry) {
+                    $keyword = $entry['keyword'];
+                    self::$ENTRIES[$keyword] = $entry;
+                }
+                apcu_store('entries', self::$ENTRIES);
+            } finally {
+                $this->unlock('entry');
             }
-            apcu_store('entries', self::$ENTRIES);
         }
 
         foreach (self::$ENTRIES as $keyword => $entry) {
@@ -133,20 +141,21 @@ $container = new class extends \Slim\Container {
         return self::$ENTRIES_BY_CHAR_LENGTH;
     }
 
-    public function lock($timeout_micro_secs = 10000) {
+    public function lock($key) {
         static $INTERVAL = 10;
+        static $TRIAL_TIMES = 1000;
+
         $count = 0;
-        $trial_times = (int) max(1, $timeout_micro_secs / $INTERVAL);
-        while (apcu_add('entry_lock', 1, 1) !== true) {
-            if (++$count > $trial_times) {
+        while (apcu_add("{$key}_lock", 1, 1) !== true) {
+            if (++$count > $TRIAL_TIMES) {
                 throw new \Exception('dead lock');
             }
             usleep($INTERVAL);
         }
     }
 
-    public function unlock() {
-        apcu_delete('entry_lock');
+    public function unlock($key) {
+        apcu_delete("{$key}_lock");
     }
 
     public function htmlify($content) {
@@ -179,14 +188,35 @@ $container = new class extends \Slim\Container {
     }
 
     public function load_stars($keyword) {
-        $keyword = rawurlencode($keyword);
-        $origin = config('isutar_origin');
-        $url = "{$origin}/stars?keyword={$keyword}";
-        $ua = new \GuzzleHttp\Client;
-        $res = $ua->request('GET', $url)->getBody();
-        $data = json_decode($res, true);
+        // $keyword = rawurlencode($keyword);
+        // $origin = config('isutar_origin');
+        // $url = "{$origin}/stars?keyword={$keyword}";
+        // $ua = new \GuzzleHttp\Client;
+        // $res = $ua->request('GET', $url)->getBody();
+        // $data = json_decode($res, true);
+        //
+        // return $data['stars'];
+        return $this->get_stars($keyword);
+    }
 
-        return $data['stars'];
+    public function get_stars($keyword) {
+        if (isset(self::$STARS[$keyword]) !== true) {
+            self::$STARS[$keyword] = apcu_fetch("starts_{$keyword}");
+        }
+        return self::$STARS[$keyword] ?: [];
+    }
+
+    public function add_star($keyword, $user_name) {
+        $this->lock('star');
+        try {
+            $stars = $this->get_stars($keyword);
+            $stars[] = ['keyword' => $keyword, 'user_name' => $user_name];
+
+            self::$STARS[$keyword] = $stars;
+            apcu_store("starts_{$keyword}", $stars);
+        } finally {
+            $this->unlock('star');
+        }
     }
 };
 $container['view'] = function ($container) {
@@ -228,9 +258,9 @@ $app->get('/initialize', function (Request $req, Response $c) {
         'DELETE FROM entry WHERE id > 7101'
     );
     $this->initialize();
-    $origin = config('isutar_origin');
-    $url = "$origin/initialize";
-    file_get_contents($url);
+    // $origin = config('isutar_origin');
+    // $url = "$origin/initialize";
+    // file_get_contents($url);
     return render_json($c, [
         'result' => 'ok',
     ]);
@@ -399,5 +429,25 @@ function is_spam_contents($content) {
     $data = json_decode($res, true);
     return !$data['valid'];
 }
+
+// From isutar
+$app->get('/stars', function (Request $req, Response $c) {
+    $keyword = $req->getParams()['keyword'];
+    return render_json($c, [
+        'stars' => $this->get_stars($keyword),
+    ]);
+});
+$app->post('/stars', function (Request $req, Response $c) {
+    $keyword = $req->getParams()['keyword'];
+    if (empty($this->get_entry($keyword))) {
+        return $c->withStatus(404);
+    }
+
+    $this->add_star($keyword, $req->getParams()['user']);
+
+    return render_json($c, [
+        'result' => 'ok',
+    ]);
+});
 
 $app->run();
