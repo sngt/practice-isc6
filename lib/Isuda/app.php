@@ -42,6 +42,10 @@ $container = new class extends \Slim\Container {
         ));
     }
 
+    public function debug_log($message) {
+        file_put_contents('/home/isucon/.local/php/var/log/debug.log', $message . "\n", FILE_APPEND);
+    }
+
     public function initialize() {
         apcu_clear_cache();
         $this->get_entries();
@@ -59,24 +63,34 @@ $container = new class extends \Slim\Container {
         $keyword = $entry['keyword'];
         $this->delete_entry($keyword);
 
-        self::$ENTRIES[$keyword] = $entry;
-        self::$CHAR_LENGTH_ENTRY_MAP[$keyword][$keyword] = $entry;
+        $this->lock();
+        try {
+            self::$ENTRIES[$keyword] = $entry;
+            self::$CHAR_LENGTH_ENTRY_MAP[$keyword][$keyword] = $entry;
 
-        apcu_store('entries', self::$ENTRIES);
+            apcu_store('entries', self::$ENTRIES);
+        } finally {
+            $this->unlock();
+        }
     }
 
     public function delete_entry($keyword) {
-        if (empty($this->get_entry($keyword))) {
-            return false;
-        }
+        $this->lock();
+        try {
+            if (empty($this->get_entry($keyword))) {
+                return false;
+            }
 
-        unset(self::$ENTRIES[$keyword]);
-        unset(self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword]);
-        if (self::$ENTRIES_BY_CHAR_LENGTH) {
-            self::$ENTRIES_BY_CHAR_LENGTH = [];
-        }
+            unset(self::$ENTRIES[$keyword]);
+            unset(self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword]);
+            if (self::$ENTRIES_BY_CHAR_LENGTH) {
+                self::$ENTRIES_BY_CHAR_LENGTH = [];
+            }
 
-        apcu_store('entries', self::$ENTRIES);
+            apcu_store('entries', self::$ENTRIES);
+        } finally {
+            $this->unlock();
+        }
         return true;
     }
 
@@ -117,6 +131,22 @@ $container = new class extends \Slim\Container {
             }
         }
         return self::$ENTRIES_BY_CHAR_LENGTH;
+    }
+
+    public function lock($timeout_micro_secs = 10000) {
+        static $INTERVAL = 10;
+        $count = 0;
+        $trial_times = (int) max(1, $timeout_micro_secs / $INTERVAL);
+        while (apcu_add('entry_lock', 1, 1) !== true) {
+            if (++$count > $trial_times) {
+                throw new \Exception('dead lock');
+            }
+            usleep($INTERVAL);
+        }
+    }
+
+    public function unlock() {
+        apcu_delete('entry_lock');
     }
 
     public function htmlify($content) {
@@ -193,11 +223,11 @@ $mw['authenticate'] = function ($req, $c, $next) {
     return $next($req, $c);
 };
 
-$app->get('/initialize', function (Request $req, Response $c) use($container) {
+$app->get('/initialize', function (Request $req, Response $c) {
     $this->dbh->query(
         'DELETE FROM entry WHERE id > 7101'
     );
-    $container->initialize();
+    $this->initialize();
     $origin = config('isutar_origin');
     $url = "$origin/initialize";
     file_get_contents($url);
@@ -206,7 +236,7 @@ $app->get('/initialize', function (Request $req, Response $c) use($container) {
     ]);
 });
 
-$app->get('/', function (Request $req, Response $c) use($container) {
+$app->get('/', function (Request $req, Response $c) {
     $PER_PAGE = 10;
     $page = $req->getQueryParams()['page'] ?? 1;
 
@@ -217,9 +247,9 @@ $app->get('/', function (Request $req, Response $c) use($container) {
     //     "LIMIT $PER_PAGE ".
     //     "OFFSET $offset"
     // );
-    $all_entries = $container->get_entries();
+    $all_entries = $this->get_entries();
     $total_entries = count($all_entries);
-    $offset = ($total_entries - 1) - ($page * $PER_PAGE);
+    $offset = $total_entries - ($page * $PER_PAGE);
     $entries = array_slice($all_entries, $offset, $PER_PAGE);
     foreach ($entries as &$entry) {
         $entry['html']  = $this->htmlify($entry['description']);
@@ -240,7 +270,7 @@ $app->get('/robots.txt', function (Request $req, Response $c) {
     return $c->withStatus(404);
 });
 
-$app->post('/keyword', function (Request $req, Response $c) use($container) {
+$app->post('/keyword', function (Request $req, Response $c) {
     $keyword = $req->getParsedBody()['keyword'];
     if (!isset($keyword)) {
         return $c->withStatus(400)->write("'keyword' required");
@@ -251,7 +281,7 @@ $app->post('/keyword', function (Request $req, Response $c) use($container) {
     if (is_spam_contents($description) || is_spam_contents($keyword)) {
         return $c->withStatus(400)->write('SPAM!');
     }
-    $container->set_entry([
+    $this->set_entry([
         'author_id' => $user_id,
         'keyword' => $keyword,
         'description' => $description
@@ -324,7 +354,7 @@ $app->get('/logout', function (Request $req, Response $c) {
     return $c->withRedirect('/');
 });
 
-$app->get('/keyword/{keyword}', function (Request $req, Response $c) use($container) {
+$app->get('/keyword/{keyword}', function (Request $req, Response $c) {
     $keyword = $req->getAttribute('keyword');
     if ($keyword === null) return $c->withStatus(400);
 
@@ -332,7 +362,7 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) use($contai
     //     'SELECT * FROM entry'
     //     .' WHERE keyword = ?'
     // , $keyword);
-    $entry = $container->get_entry($keyword);
+    $entry = $this->get_entry($keyword);
     if (empty($entry)) return $c->withStatus(404);
     $entry['html'] = $this->htmlify($entry['description']);
     $entry['stars'] = $this->load_stars($entry['keyword']);
@@ -342,7 +372,7 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) use($contai
     ]);
 })->add($mw['set_name']);
 
-$app->post('/keyword/{keyword}', function (Request $req, Response $c) use($container) {
+$app->post('/keyword/{keyword}', function (Request $req, Response $c) {
     $keyword = $req->getAttribute('keyword');
     if ($keyword === null) return $c->withStatus(400);
     $delete = $req->getParsedBody()['delete'];
@@ -355,7 +385,7 @@ $app->post('/keyword/{keyword}', function (Request $req, Response $c) use($conta
     // if (empty($entry)) return $c->withStatus(404);
     //
     // $this->dbh->query('DELETE FROM entry WHERE keyword = ?', $keyword);
-    if ($container->delete_entry($keyword) !== true) {
+    if ($this->delete_entry($keyword) !== true) {
         return $c->withStatus(404);
     }
     return $c->withRedirect('/');
