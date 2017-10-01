@@ -31,18 +31,19 @@ $container = new class extends \Slim\Container {
     private static $ENTRIES_BY_CHAR_LENGTH = [];
 
     private static $STARS = [];
+    private static $USERS = [];
 
     public $dbh;
-    public function __construct() {
-        parent::__construct();
-
-        $this->dbh = new PDOWrapper(new PDO(
-            $_ENV['ISUDA_DSN'],
-            $_ENV['ISUDA_DB_USER'] ?? 'isucon',
-            $_ENV['ISUDA_DB_PASSWORD'] ?? 'isucon',
-            [ PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4" ]
-        ));
-    }
+    // public function __construct() {
+    //     parent::__construct();
+    //
+    //     $this->dbh = new PDOWrapper(new PDO(
+    //         $_ENV['ISUDA_DSN'],
+    //         $_ENV['ISUDA_DB_USER'] ?? 'isucon',
+    //         $_ENV['ISUDA_DB_PASSWORD'] ?? 'isucon',
+    //         [ PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4" ]
+    //     ));
+    // }
 
     public function debug_log($message) {
         file_put_contents('/home/isucon/.local/php/var/log/debug.log', $message . "\n", FILE_APPEND);
@@ -106,12 +107,13 @@ $container = new class extends \Slim\Container {
         if (empty(self::$ENTRIES)) {
             $this->lock('entry');
             try {
-                $entries = $this->dbh->select_all(
-                    'SELECT * FROM entry ORDER BY updated_at DESC'
+                $entries = json_decode(
+                    file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
+                    true
                 );
+
                 foreach ($entries as $entry) {
-                    $keyword = $entry['keyword'];
-                    self::$ENTRIES[$keyword] = $entry;
+                    self::$ENTRIES[$entry['keyword']] = $entry;
                 }
                 apcu_store('entries', self::$ENTRIES);
             } finally {
@@ -143,7 +145,7 @@ $container = new class extends \Slim\Container {
 
     public function lock($key) {
         static $INTERVAL = 10;
-        static $TRIAL_TIMES = 1000;
+        static $TRIAL_TIMES = 5000;
 
         $count = 0;
         while (apcu_add("{$key}_lock", 1, 1) !== true) {
@@ -218,6 +220,48 @@ $container = new class extends \Slim\Container {
             $this->unlock('star');
         }
     }
+
+    public function get_user($id) {
+        static $users_by_id = [];
+        if ($users_by_id) {
+            return $users_by_id[$id] ?? null;
+        }
+
+        foreach ($this->loadUsers() as $user) {
+            $users_by_id[$user['id']] = $user;
+        }
+
+        return $users_by_id[$id] ?? null;
+    }
+
+    public function get_user_by_name($name) {
+        static $users_by_name = [];
+        if ($users_by_name) {
+            return $users_by_name[$name] ?? null;
+        }
+
+        foreach ($this->loadUsers() as $user) {
+            $users_by_name[$user['name']] = $user;
+        }
+
+        return $users_by_name[$name] ?? null;
+    }
+
+    private function loadUsers() {
+        if (self::$USERS) {
+            return self::$USERS;
+        }
+        self::$USERS = apcu_fetch('users');
+        if (self::$USERS) {
+            return self::$USERS;
+        }
+        self::$USERS = json_decode(
+            file_get_contents('/home/isucon/webapp/php/lib/Isuda/user.json'),
+            true
+        );
+        apcu_store('users', self::$USERS);
+        return self::$USERS;
+    }
 };
 $container['view'] = function ($container) {
     $view = new \Slim\Views\Twig($_ENV['PHP_TEMPLATE_PATH'], []);
@@ -236,9 +280,10 @@ $mw['set_name'] = function ($req, $c, $next) {
     $user_id = $_SESSION['user_id'] ?? null;
     if (isset($user_id)) {
         $this->get('stash')['user_id'] = $user_id;
-        $this->get('stash')['user_name'] = $this->dbh->select_one(
-            'SELECT name FROM user WHERE id = ?'
-            , $user_id);
+        // $this->get('stash')['user_name'] = $this->dbh->select_one(
+        //     'SELECT name FROM user WHERE id = ?'
+        //     , $user_id);
+        $this->get('stash')['user_name'] = $this->get_user($user_id)['name'];
         if (!isset($this->get('stash')['user_name'])) {
             return $c->withStatus(403);
         }
@@ -254,9 +299,9 @@ $mw['authenticate'] = function ($req, $c, $next) {
 };
 
 $app->get('/initialize', function (Request $req, Response $c) {
-    $this->dbh->query(
-        'DELETE FROM entry WHERE id > 7101'
-    );
+    // $this->dbh->query(
+    //     'DELETE FROM entry WHERE id > 7101'
+    // );
     $this->initialize();
     // $origin = config('isutar_origin');
     // $url = "$origin/initialize";
@@ -362,10 +407,11 @@ $app->get('/login', function (Request $req, Response $c) {
 
 $app->post('/login', function (Request $req, Response $c) {
     $name = $req->getParsedBody()['name'];
-    $row = $this->dbh->select_row(
-        'SELECT * FROM user'
-        . ' WHERE name = ?'
-    , $name);
+    // $row = $this->dbh->select_row(
+    //     'SELECT * FROM user'
+    //     . ' WHERE name = ?'
+    // , $name);
+    $row = $this->get_user_by_name($name);
     if (!$row || $row['password'] !== sha1($row['salt'].$req->getParsedBody()['password'])) {
         return $c->withStatus(403);
     }
