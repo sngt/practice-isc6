@@ -6,6 +6,8 @@ use Slim\Http\Response;
 use PDO;
 use PDOWrapper;
 
+// xhprof_enable();
+
 function config($key) {
     static $conf;
     if ($conf === null) {
@@ -25,14 +27,6 @@ function config($key) {
 }
 
 $container = new class extends \Slim\Container {
-    private static $ENTRIES = [];
-
-    private static $CHAR_LENGTH_ENTRY_MAP = [];
-    private static $ENTRIES_BY_CHAR_LENGTH = [];
-
-    private static $STARS = [];
-    private static $USERS = [];
-
     public $dbh;
     // public function __construct() {
     //     parent::__construct();
@@ -46,33 +40,54 @@ $container = new class extends \Slim\Container {
     // }
 
     public function debug_log($message) {
-        file_put_contents('/home/isucon/.local/php/var/log/debug.log', $message . "\n", FILE_APPEND);
+        file_put_contents('/home/isucon/.local/php/var/log/debug.log', "{$message}\n", FILE_APPEND);
     }
 
     public function initialize() {
         apcu_clear_cache();
-        $this->get_entries();
-        self::$STARS = [];
+        $this->initialize_entries();
+        $this->initialize_users();
     }
 
     public function get_entry($keyword) {
-        $entries = $this->get_entries();
-        if (isset($entries[$keyword])) {
-            return $entries[$keyword];
+        return $this->get_entries()[$keyword] ?? null;
+    }
+
+    public function get_entries() {
+        if ($entries = apcu_fetch('entries')) {
+            return $entries;
         }
-        return null;
+        return $this->initialize_entries();
+    }
+
+    public function get_quoted_keywords_sorted_by_char_length() {
+        $keywords = array_keys($this->get_entries());
+        usort($keywords, function ($a, $b) {
+            return mb_strlen($b) - mb_strlen($a);
+        });
+        return array_map(function ($keyword) {
+            return quotemeta($keyword);
+        }, $keywords);
     }
 
     public function set_entry($entry) {
         $keyword = $entry['keyword'];
-        $this->delete_entry($keyword);
-
         $this->lock('entry');
         try {
-            self::$ENTRIES[$keyword] = $entry;
-            self::$CHAR_LENGTH_ENTRY_MAP[$keyword][$keyword] = $entry;
+            $entries = $this->get_entries();
+            if (isset($entries[$keyword])) {
+                unset($entries[$keyword]);
+                apcu_delete("htmlified_{$keyword}");
+            } else {
+                foreach ($entries as $targetKeyword => $targetEntry) {
+                    if (mb_strpos($targetEntry['description'], $keyword) !== false) {
+                        apcu_delete("htmlified_{$targetKeyword}");
+                    }
+                }
+            }
 
-            apcu_store('entries', self::$ENTRIES);
+            $entries[$keyword] = $entry;
+            apcu_store('entries', $entries);
         } finally {
             $this->unlock('entry');
         }
@@ -81,71 +96,22 @@ $container = new class extends \Slim\Container {
     public function delete_entry($keyword) {
         $this->lock('entry');
         try {
-            if (empty($this->get_entry($keyword))) {
+            $entries = $this->get_entries();
+            if (empty($entries($keyword))) {
                 return false;
             }
 
-            unset(self::$ENTRIES[$keyword]);
-            unset(self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword]);
-            if (self::$ENTRIES_BY_CHAR_LENGTH) {
-                self::$ENTRIES_BY_CHAR_LENGTH = [];
-            }
-
-            apcu_store('entries', self::$ENTRIES);
+            unset($entries[$keyword]);
+            apcu_store('entries', $entries);
         } finally {
             $this->unlock('entry');
         }
         return true;
     }
 
-    public function get_entries() {
-        if (self::$ENTRIES) {
-            return $ENTRIES;
-        }
-
-        self::$ENTRIES = apcu_fetch('entries');
-        if (empty(self::$ENTRIES)) {
-            $this->lock('entry');
-            try {
-                $entries = json_decode(
-                    file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
-                    true
-                );
-
-                foreach ($entries as $entry) {
-                    self::$ENTRIES[$entry['keyword']] = $entry;
-                }
-                apcu_store('entries', self::$ENTRIES);
-            } finally {
-                $this->unlock('entry');
-            }
-        }
-
-        foreach (self::$ENTRIES as $keyword => $entry) {
-            self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword] = $entry;
-        }
-
-        return self::$ENTRIES;
-    }
-
-    public function get_entries_sorted_by_char_length() {
-        if (empty(self::$ENTRIES_BY_CHAR_LENGTH)) {
-            if (empty(self::$CHAR_LENGTH_ENTRY_MAP)) {
-                foreach ($this->get_entry() as $keyword => $entry) {
-                    self::$CHAR_LENGTH_ENTRY_MAP[mb_strlen($keyword)][$keyword] = $entry;
-                }
-            }
-            krsort(self::$CHAR_LENGTH_ENTRY_MAP);
-            foreach (self::$CHAR_LENGTH_ENTRY_MAP as $entries) {
-                self::$ENTRIES_BY_CHAR_LENGTH = array_merge(self::$ENTRIES_BY_CHAR_LENGTH, $entries);
-            }
-        }
-        return self::$ENTRIES_BY_CHAR_LENGTH;
-    }
-
     public function lock($key) {
         static $INTERVAL = 10;
-        static $TRIAL_TIMES = 5000;
+        static $TRIAL_TIMES = 50000;
 
         $count = 0;
         while (apcu_add("{$key}_lock", 1, 1) !== true) {
@@ -160,19 +126,36 @@ $container = new class extends \Slim\Container {
         apcu_delete("{$key}_lock");
     }
 
-    public function htmlify($content) {
-        if (!isset($content)) {
+    public function htmlify($entry) {
+        if (empty($entry) || !isset($entry['keyword']) || !isset($entry['description'])) {
             return '';
         }
+        $keyword = $entry['keyword'];
+        // if ($cached = apcu_fetch("htmlified_{$keyword}")) {
+        //     return $cached;
+        // }
+
+        $content = $entry['description'];
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
         // );
-        $keywords = $this->get_entries_sorted_by_char_length();
+        static $keywords;
+        if (empty($keywords)) {
+            $keywords = $this->get_quoted_keywords_sorted_by_char_length();
+        }
+
         $kw2sha = [];
 
         // NOTE: avoid pcre limitation "regular expression is too large at offset"
+        // for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
+        //     $re = implode('|', array_map(function ($keyword) { return quotemeta($keyword['keyword']); }, $kwtmp));
+        //     preg_replace_callback("/($re)/", function ($m) use (&$kw2sha) {
+        //         $kw = $m[1];
+        //         return $kw2sha[$kw] = "isuda_" . sha1($kw);
+        //     }, $content);
+        // }
         for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
-            $re = implode('|', array_map(function ($keyword) { return quotemeta($keyword['keyword']); }, $kwtmp));
+            $re = implode('|', $kwtmp);
             preg_replace_callback("/($re)/", function ($m) use (&$kw2sha) {
                 $kw = $m[1];
                 return $kw2sha[$kw] = "isuda_" . sha1($kw);
@@ -186,7 +169,9 @@ $container = new class extends \Slim\Container {
 
             $content = preg_replace("/{$hash}/", $link, $content);
         }
-        return nl2br($content, true);
+        $htmlified = nl2br($content, true);
+        apcu_store("htmlified_{$keyword}", $htmlified);
+        return $htmlified;
     }
 
     public function load_stars($keyword) {
@@ -198,69 +183,65 @@ $container = new class extends \Slim\Container {
         // $data = json_decode($res, true);
         //
         // return $data['stars'];
-        return $this->get_stars($keyword);
-    }
-
-    public function get_stars($keyword) {
-        if (isset(self::$STARS[$keyword]) !== true) {
-            self::$STARS[$keyword] = apcu_fetch("starts_{$keyword}");
-        }
-        return self::$STARS[$keyword] ?: [];
+        return apcu_fetch("starts_{$keyword}") ?: [];
     }
 
     public function add_star($keyword, $user_name) {
-        $this->lock('star');
+        $cache_key = "starts_{$keyword}";
+        $this->lock($cache_key);
         try {
-            $stars = $this->get_stars($keyword);
+            $stars = $this->load_stars($keyword);
             $stars[] = ['keyword' => $keyword, 'user_name' => $user_name];
-
-            self::$STARS[$keyword] = $stars;
-            apcu_store("starts_{$keyword}", $stars);
+            apcu_store($cache_key, $stars);
         } finally {
-            $this->unlock('star');
+            $this->unlock($cache_key);
         }
     }
 
     public function get_user($id) {
-        static $users_by_id = [];
-        if ($users_by_id) {
-            return $users_by_id[$id] ?? null;
+        if (empty($users = apcu_fetch('users_by_id'))) {
+            list($users) = $this->initialize_users();
         }
-
-        foreach ($this->loadUsers() as $user) {
-            $users_by_id[$user['id']] = $user;
-        }
-
-        return $users_by_id[$id] ?? null;
+        return $users[$id] ?? null;
     }
 
     public function get_user_by_name($name) {
-        static $users_by_name = [];
-        if ($users_by_name) {
-            return $users_by_name[$name] ?? null;
+        if (empty($users = apcu_fetch('users_by_name'))) {
+            list(, $users) = $this->initialize_users();
         }
-
-        foreach ($this->loadUsers() as $user) {
-            $users_by_name[$user['name']] = $user;
-        }
-
-        return $users_by_name[$name] ?? null;
+        return $users[$name] ?? null;
     }
 
-    private function loadUsers() {
-        if (self::$USERS) {
-            return self::$USERS;
+    private function initialize_entries() {
+        $this->lock('entry');
+        $json = json_decode(
+            file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
+            true
+        );
+        $entries = [];
+        foreach ($json as $entry) {
+            $entries[$entry['keyword']] = $entry;
         }
-        self::$USERS = apcu_fetch('users');
-        if (self::$USERS) {
-            return self::$USERS;
-        }
-        self::$USERS = json_decode(
+        apcu_store('entries', $entries);
+        $this->unlock('entry');
+        return $entries;
+    }
+
+    private function initialize_users() {
+        $this->lock('user');
+        $json = json_decode(
             file_get_contents('/home/isucon/webapp/php/lib/Isuda/user.json'),
             true
         );
-        apcu_store('users', self::$USERS);
-        return self::$USERS;
+        $users_by_id = $users_by_name = [];
+        foreach ($json as $user) {
+            $users_by_id[$user['id']] = $user;
+            $users_by_name[$user['name']] = $user;
+        }
+        apcu_store('users_by_id', $users_by_id);
+        apcu_store('users_by_name', $users_by_name);
+        $this->unlock('user');
+        return [$users_by_id, $users_by_name];
     }
 };
 $container['view'] = function ($container) {
@@ -327,7 +308,7 @@ $app->get('/', function (Request $req, Response $c) {
     $offset = $total_entries - ($page * $PER_PAGE);
     $entries = array_slice($all_entries, $offset, $PER_PAGE);
     foreach ($entries as &$entry) {
-        $entry['html']  = $this->htmlify($entry['description']);
+        $entry['html']  = $this->htmlify($entry);
         $entry['stars'] = $this->load_stars($entry['keyword']);
     }
     unset($entry);
@@ -377,27 +358,27 @@ $app->get('/register', function (Request $req, Response $c) {
     ]);
 })->add($mw['set_name'])->setName('/register');
 
-$app->post('/register', function (Request $req, Response $c) {
-    $name = $req->getParsedBody()['name'];
-    $pw   = $req->getParsedBody()['password'];
-    if ($name === '' || $pw === '') {
-        return $c->withStatus(400);
-    }
-    $user_id = register($this->dbh, $name, $pw);
-
-    $_SESSION['user_id'] = $user_id;
-    return $c->withRedirect('/');
-});
-
-function register($dbh, $user, $pass) {
-    $salt = random_string('....................');
-    $dbh->query(
-        'INSERT INTO user (name, salt, password, created_at)'
-        .' VALUES (?, ?, ?, NOW())'
-    , $user, $salt, sha1($salt . $pass));
-
-    return $dbh->last_insert_id();
-}
+// $app->post('/register', function (Request $req, Response $c) {
+//     $name = $req->getParsedBody()['name'];
+//     $pw   = $req->getParsedBody()['password'];
+//     if ($name === '' || $pw === '') {
+//         return $c->withStatus(400);
+//     }
+//     $user_id = register($this->dbh, $name, $pw);
+//
+//     $_SESSION['user_id'] = $user_id;
+//     return $c->withRedirect('/');
+// });
+//
+// function register($dbh, $user, $pass) {
+//     $salt = random_string('....................');
+//     $dbh->query(
+//         'INSERT INTO user (name, salt, password, created_at)'
+//         .' VALUES (?, ?, ?, NOW())'
+//     , $user, $salt, sha1($salt . $pass));
+//
+//     return $dbh->last_insert_id();
+// }
 
 $app->get('/login', function (Request $req, Response $c) {
     return $this->view->render($c, 'authenticate.twig', [
@@ -440,7 +421,7 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) {
     // , $keyword);
     $entry = $this->get_entry($keyword);
     if (empty($entry)) return $c->withStatus(404);
-    $entry['html'] = $this->htmlify($entry['description']);
+    $entry['html'] = $this->htmlify($entry);
     $entry['stars'] = $this->load_stars($entry['keyword']);
 
     return $this->view->render($c, 'keyword.twig', [
@@ -480,7 +461,7 @@ function is_spam_contents($content) {
 $app->get('/stars', function (Request $req, Response $c) {
     $keyword = $req->getParams()['keyword'];
     return render_json($c, [
-        'stars' => $this->get_stars($keyword),
+        'stars' => $this->load_stars($keyword),
     ]);
 });
 $app->post('/stars', function (Request $req, Response $c) {
