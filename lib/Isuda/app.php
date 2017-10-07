@@ -6,7 +6,7 @@ use Slim\Http\Response;
 use PDO;
 use PDOWrapper;
 
-// xhprof_enable();
+ini_set('memory_limit', '1G');
 
 function config($key) {
     static $conf;
@@ -44,10 +44,10 @@ $container = new class extends \Slim\Container {
     }
 
     public function initialize() {
-        // apcu_clear_cache();
-        // $this->initialize_entries();
-        // $this->initialize_htmlified();
-        // $this->initialize_users();
+        apcu_clear_cache();
+        $this->initialize_entries();
+        $this->initialize_htmlified();
+        $this->initialize_users();
     }
 
     public function get_entry($keyword) {
@@ -135,7 +135,7 @@ $container = new class extends \Slim\Container {
         if ($cached = apcu_fetch("htmlified_{$keyword}")) {
             return $cached;
         }
-
+$this->debug_log($keyword);
         $content = $entry['description'];
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
@@ -491,26 +491,23 @@ $app->post('/stars', function (Request $req, Response $c) {
 
 
 
+$app->get('/create', function (Request $req, Response $c) {
+    set_time_limit(240);
+    $htmlified = $this->initialize_htmlified();
+    $target = [
+        '機動戦士ガンダムSEED DESTINY ASTRAY', 'アグリッパ2世', '八頭町', '近藤勇五郎', '伊予市駅', '武部勤', '早島駅', '哲西町',
+    ];
+    foreach ($target as $keyword) {
+        $entry = $this->get_entry($keyword);
+        if ($entry) {
+            apcu_delete("htmlified_{$keyword}");
+            $htmlified[$keyword] = $this->htmlify($entry);
+        }
+    }
 
-// $app->get('/create', function (Request $req, Response $c) {
-//     ini_set('memory_limit', '1G');
-//     set_time_limit(240);
-//     $htmlified = $this->initialize_htmlified();
-//     $target = [
-//         '1099年', '山口淳', '居合道', '帯広駅', '香取郡', '名鉄一宮線', '菖蒲町', 'ニューエイジ',
-//         'キングスタウン', '茨戸川', '新川停留場', '玖珂町'
-//     ];
-//     foreach ($target as $keyword) {
-//         $entry = $this->get_entry($keyword);
-//         if ($entry) {
-//             apcu_delete("$keyword");
-//             $htmlified[$keyword] = $this->htmlify($entry);
-//         }
-//     }
-//
-//     file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($htmlified));
-//     return render_json($c, ['result' => 'ok']);
-// });
+    file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($htmlified));
+    return render_json($c, ['result' => 'ok']);
+});
 
 
 
