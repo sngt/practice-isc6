@@ -6,7 +6,10 @@ use Slim\Http\Response;
 use PDO;
 use PDOWrapper;
 
-// xhprof_enable();
+use Tree;
+use Node;
+
+ini_set('memory_limit', '1G');
 
 function config($key) {
     static $conf;
@@ -60,15 +63,21 @@ $container = new class extends \Slim\Container {
         return $this->initialize_entries();
     }
 
-    public function get_quoted_keywords_sorted_by_char_length() {
-        $keywords = array_keys($this->get_entries());
-        usort($keywords, function ($a, $b) {
-            return mb_strlen($b) - mb_strlen($a);
-        });
-        return array_map(function ($keyword) {
-            return quotemeta($keyword);
-        }, $keywords);
-    }
+    // public function get_quoted_keywords_sorted_by_char_length() {
+    //     if ($cached = apcu_fetch('all_quated_keywords')) {
+    //         return $cached;
+    //     }
+    //
+    //     $keywords = array_keys($this->get_entries());
+    //     usort($keywords, function ($a, $b) {
+    //         return mb_strlen($b) - mb_strlen($a);
+    //     });
+    //     $quated = array_map(function ($keyword) {
+    //         return quotemeta($keyword);
+    //     }, $keywords);
+    //     apcu_store('all_quated_keywords', $quated);
+    //     return $quated;
+    // }
 
     public function set_entry($entry) {
         $keyword = $entry['keyword'];
@@ -84,6 +93,11 @@ $container = new class extends \Slim\Container {
                         apcu_delete("htmlified_{$targetKeyword}");
                     }
                 }
+                // apcu_delete('all_quated_keywords');
+
+                $tree = apcu_fetch('tree');
+                $tree->add($keyword);
+                apcu_store('tree', $tree);
             }
 
             $entries[$keyword] = $entry;
@@ -102,6 +116,18 @@ $container = new class extends \Slim\Container {
             }
 
             unset($entries[$keyword]);
+            // if ($all_quated_keywords = apcu_fetch('all_quated_keywords')) {
+            //     $quatedIndex = array_search($all_quated_keywords);
+            //     if ($quatedIndex !== false) {
+            //         unset($all_quated_keywords[$quatedIndex]);
+            //         apcu_store('all_quated_keywords', $all_quated_keywords);
+            //     }
+            // }
+
+            $tree = apcu_fetch('tree');
+            $tree->delete($keyword);
+            apcu_store('tree', $tree);
+
             apcu_store('entries', $entries);
         } finally {
             $this->unlock('entry');
@@ -110,7 +136,7 @@ $container = new class extends \Slim\Container {
     }
 
     public function lock($key) {
-        static $INTERVAL = 10;
+        static $INTERVAL = 5;
         static $TRIAL_TIMES = 50000;
 
         $count = 0;
@@ -135,16 +161,16 @@ $container = new class extends \Slim\Container {
         //     return $cached;
         // }
 
-        $content = $entry['description'];
+        // $content = $entry['description'];
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
         // );
-        static $keywords;
-        if (empty($keywords)) {
-            $keywords = $this->get_quoted_keywords_sorted_by_char_length();
-        }
+        // static $keywords;
+        // if (empty($keywords)) {
+        //     $keywords = $this->get_quoted_keywords_sorted_by_char_length();
+        // }
 
-        $kw2sha = [];
+        // $kw2sha = [];
 
         // NOTE: avoid pcre limitation "regular expression is too large at offset"
         // for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
@@ -154,21 +180,26 @@ $container = new class extends \Slim\Container {
         //         return $kw2sha[$kw] = "isuda_" . sha1($kw);
         //     }, $content);
         // }
-        for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
-            $re = implode('|', $kwtmp);
-            preg_replace_callback("/($re)/", function ($m) use (&$kw2sha) {
-                $kw = $m[1];
-                return $kw2sha[$kw] = "isuda_" . sha1($kw);
-            }, $content);
-        }
-        $content = strtr($content, $kw2sha);
-        $content = html_escape($content);
-        foreach ($kw2sha as $kw => $hash) {
+        // for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
+        //     $re = implode('|', $kwtmp);
+        //     preg_replace_callback("/($re)/", function ($m) use (&$kw2sha) {
+        //         $kw = $m[1];
+        //         return $kw2sha[$kw] = "isuda_" . sha1($kw);
+        //     }, $content);
+        // }
+        // $content = strtr($content, $kw2sha);
+        // $content = html_escape($content);
+        // foreach ($kw2sha as $kw => $hash) {
+        //     $url = '/keyword/' . rawurlencode($kw);
+        //     $link = sprintf('<a href="%s">%s</a>', $url, html_escape($kw));
+        //
+        //     $content = preg_replace("/{$hash}/", $link, $content);
+        // }
+        $tree = apcu_fetch('tree');
+        $content = $tree->replace_all($entry['description'], function ($kw) {
             $url = '/keyword/' . rawurlencode($kw);
-            $link = sprintf('<a href="%s">%s</a>', $url, html_escape($kw));
-
-            $content = preg_replace("/{$hash}/", $link, $content);
-        }
+            return sprintf('<a href="%s">%s</a>', $url, html_escape($kw));
+        });
         $htmlified = nl2br($content, true);
         apcu_store("htmlified_{$keyword}", $htmlified);
         return $htmlified;
@@ -219,10 +250,13 @@ $container = new class extends \Slim\Container {
             true
         );
         $entries = [];
+        $tree = new Tree();
         foreach ($json as $entry) {
             $entries[$entry['keyword']] = $entry;
+            $tree->add($entry['keyword']);
         }
         apcu_store('entries', $entries);
+        apcu_store('tree', $tree);
         $this->unlock('entry');
         return $entries;
     }
