@@ -44,9 +44,10 @@ $container = new class extends \Slim\Container {
     }
 
     public function initialize() {
-        apcu_clear_cache();
-        $this->initialize_entries();
-        $this->initialize_users();
+        // apcu_clear_cache();
+        // $this->initialize_entries();
+        // $this->initialize_htmlified();
+        // $this->initialize_users();
     }
 
     public function get_entry($keyword) {
@@ -77,13 +78,13 @@ $container = new class extends \Slim\Container {
             $entries = $this->get_entries();
             if (isset($entries[$keyword])) {
                 unset($entries[$keyword]);
-                apcu_delete("htmlified_{$keyword}");
+                // apcu_delete("htmlified_{$keyword}");
             } else {
-                foreach ($entries as $targetKeyword => $targetEntry) {
-                    if (mb_strpos($targetEntry['description'], $keyword) !== false) {
-                        apcu_delete("htmlified_{$targetKeyword}");
-                    }
-                }
+                // foreach ($entries as $targetKeyword => $targetEntry) {
+                //     if (mb_strpos($targetEntry['description'], $keyword) !== false) {
+                //         apcu_delete("htmlified_{$targetKeyword}");
+                //     }
+                // }
             }
 
             $entries[$keyword] = $entry;
@@ -131,9 +132,9 @@ $container = new class extends \Slim\Container {
             return '';
         }
         $keyword = $entry['keyword'];
-        // if ($cached = apcu_fetch("htmlified_{$keyword}")) {
-        //     return $cached;
-        // }
+        if ($cached = apcu_fetch("htmlified_{$keyword}")) {
+            return $cached;
+        }
 
         $content = $entry['description'];
         // $keywords = $this->dbh->select_all(
@@ -225,6 +226,17 @@ $container = new class extends \Slim\Container {
         apcu_store('entries', $entries);
         $this->unlock('entry');
         return $entries;
+    }
+
+    public function initialize_htmlified() {
+        $json = json_decode(
+            file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
+            true
+        );
+        foreach ($json as $keyword => $htmlified) {
+            apcu_store("htmlified_{$keyword}", $htmlified);
+        }
+        return $json;
     }
 
     private function initialize_users() {
@@ -476,5 +488,35 @@ $app->post('/stars', function (Request $req, Response $c) {
         'result' => 'ok',
     ]);
 });
+
+
+
+
+// $app->get('/create', function (Request $req, Response $c) {
+//     ini_set('memory_limit', '1G');
+//     set_time_limit(240);
+//     $htmlified = $this->initialize_htmlified();
+//     $target = [
+//         '1099年', '山口淳', '居合道', '帯広駅', '香取郡', '名鉄一宮線', '菖蒲町', 'ニューエイジ',
+//         'キングスタウン', '茨戸川', '新川停留場', '玖珂町'
+//     ];
+//     foreach ($target as $keyword) {
+//         $entry = $this->get_entry($keyword);
+//         if ($entry) {
+//             apcu_delete("$keyword");
+//             $htmlified[$keyword] = $this->htmlify($entry);
+//         }
+//     }
+//
+//     file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($htmlified));
+//     return render_json($c, ['result' => 'ok']);
+// });
+
+
+
+
+
+
+
 
 $app->run();
