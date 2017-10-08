@@ -5,6 +5,7 @@ use Slim\Http\Request;
 use Slim\Http\Response;
 use PDO;
 use PDOWrapper;
+use StopWatch;
 
 ini_set('memory_limit', '1G');
 
@@ -43,63 +44,9 @@ $container = new class extends \Slim\Container {
         file_put_contents('/home/isucon/.local/php/var/log/debug.log', "{$message}\n", FILE_APPEND);
     }
 
-    public function get_entry($keyword) {
-        return $this->get_entries()[$keyword] ?? null;
-    }
-
-    public function get_entries() {
-        if ($entries = apcu_fetch('entries')) {
-            return $entries;
-        }
-        return $this->initialize_entries();
-    }
-
-    public function get_quoted_keywords_sorted_by_char_length() {
-        $keywords = array_keys($this->get_entries());
-        usort($keywords, function ($a, $b) {
-            return mb_strlen($b) - mb_strlen($a);
-        });
-        return array_map(function ($keyword) {
-            return quotemeta($keyword);
-        }, $keywords);
-    }
-
-    public function set_entry($entry) {
-        $keyword = $entry['keyword'];
-        $this->lock('entry');
-        try {
-            $entries = $this->get_entries();
-            if (isset($entries[$keyword])) {
-                unset($entries[$keyword]);
-            } else {
-            }
-
-            $entries[$keyword] = $entry;
-            apcu_store('entries', $entries);
-        } finally {
-            $this->unlock('entry');
-        }
-    }
-
-    public function delete_entry($keyword) {
-        $this->lock('entry');
-        try {
-            $entries = $this->get_entries();
-            if (empty($entries($keyword))) {
-                return false;
-            }
-
-            unset($entries[$keyword]);
-            apcu_store('entries', $entries);
-        } finally {
-            $this->unlock('entry');
-        }
-        return true;
-    }
-
     public function lock($key) {
-        static $INTERVAL = 1;
-        static $TRIAL_TIMES = 50000;
+        static $INTERVAL = 10;
+        static $TRIAL_TIMES = 10000;
 
         $count = 0;
         while (apcu_add("{$key}_lock", 1, 1) !== true) {
@@ -112,6 +59,67 @@ $container = new class extends \Slim\Container {
 
     public function unlock($key) {
         apcu_delete("{$key}_lock");
+    }
+
+    public function get_entry_index() {
+        StopWatch::instance()->record('fetching index');
+        if ($cached = apcu_fetch('entry_index')) {
+            StopWatch::instance()->record('fetched index');
+            return $cached;
+        }
+        $this->initialize_entries();
+        return apcu_fetch('entry_index');
+    }
+
+    public function get_entry($keyword) {
+        if ($cached = apcu_fetch("entry_{$keyword}")) {
+            return $cached;
+        }
+        $this->initialize_entries();
+        return apcu_fetch("entry_{$keyword}") ?: null;
+    }
+
+    public function get_quoted_keywords_sorted_by_char_length() {
+        $keywords = array_values($this->get_entry_index());
+        usort($keywords, function ($a, $b) {
+            return mb_strlen($b) - mb_strlen($a);
+        });
+        return array_map(function ($keyword) {
+            return quotemeta($keyword);
+        }, $keywords);
+    }
+
+    public function set_entry($entry) {
+        $keyword = $entry['keyword'];
+        $this->lock('entry');
+        try {
+            $index = apcu_fetch('entry_index') ?:[];
+            if (isset($index[$keyword])) {
+                unset($index[$keyword]);
+            }
+            $index[$keyword] = $keyword;
+            apcu_store('entry_index', $index);
+            apcu_store("entry_{$keyword}", $entry);
+        } finally {
+            $this->unlock('entry');
+        }
+    }
+
+    public function delete_entry($keyword) {
+        $this->lock('entry');
+        try {
+            $index = apcu_fetch('entry_index') ?:[];
+            if (empty($index($keyword))) {
+                return false;
+            }
+
+            unset($index[$keyword]);
+            apcu_store('entry_index', $index);
+            apcu_delete("entry_{$keyword}");
+        } finally {
+            $this->unlock('entry');
+        }
+        return true;
     }
 
     public function htmlify($entry) {
@@ -159,7 +167,7 @@ $container = new class extends \Slim\Container {
         }
         $htmlified = nl2br($content, true);
         apcu_store("htmlified_{$keyword}", $htmlified);
-        $this->save_htmlified($keyword, $htmlified);
+        $this->debug_log($keyword);
         return $htmlified;
     }
 
@@ -188,17 +196,19 @@ $container = new class extends \Slim\Container {
     }
 
     public function get_user($id) {
-        if (empty($users = apcu_fetch('users_by_id'))) {
-            list($users) = $this->initialize_users();
+        if ($cached = apcu_fetch("user_id_{$id}")) {
+            return $cached;
         }
-        return $users[$id] ?? null;
+        $this->initialize_users();
+        return apcu_fetch("user_id_{$id}") ?: null;
     }
 
     public function get_user_by_name($name) {
-        if (empty($users = apcu_fetch('users_by_name'))) {
-            list(, $users) = $this->initialize_users();
+        if ($cached = apcu_fetch("user_name_{$name}")) {
+            return $cached;
         }
-        return $users[$name] ?? null;
+        $this->initialize_users();
+        return apcu_fetch("user_name_{$name}") ?: null;
     }
 
     public function save_htmlified($keyword, $htmlified) {
@@ -208,7 +218,7 @@ $container = new class extends \Slim\Container {
             if (empty($all)) {
                 return;
             }
-$this->debug_log($keyword);
+
             $all[$keyword] = $htmlified;
             apcu_store('htmlified_all', $all);
             file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($all));
@@ -218,54 +228,72 @@ $this->debug_log($keyword);
     }
 
     public function initialize() {
-        apcu_clear_cache();
-        $this->initialize_entries();
-        $this->initialize_htmlified();
-        $this->initialize_users();
+        if (apcu_add('initializing', 1, 3)) {
+            apcu_clear_cache();
+            $this->initialize_entries();
+            $this->initialize_htmlified();
+            $this->initialize_users();
+        }
     }
 
     private function initialize_entries() {
-        $this->lock('entry');
-        $json = json_decode(
-            file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
-            true
-        );
-        $entries = [];
-        foreach ($json as $entry) {
-            $entries[$entry['keyword']] = $entry;
+        if (apcu_fetch('entry_loaded')) {
+            return;
         }
-        apcu_store('entries', $entries);
-        $this->unlock('entry');
-        return $entries;
+
+        $this->lock('entry');
+        try {
+            $json = json_decode(
+                file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
+                true
+            );
+            $index = [];
+            foreach ($json as $entry) {
+                apcu_store("entry_{$entry['keyword']}", $entry);
+                $index[$entry['keyword']] = $entry['keyword'];
+            }
+            apcu_store('entry_index', $index);
+            apcu_store('entry_loaded', 1);
+        } finally {
+            $this->unlock('entry');
+        }
     }
 
     private function initialize_htmlified() {
-        $json = json_decode(
-            file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
-            true
-        );
-        foreach ($json as $keyword => $htmlified) {
-            apcu_store("htmlified_{$keyword}", $htmlified);
+        if (apcu_fetch('htmlified_loaded')) {
+            return;
         }
-        apcu_store('htmlified_all', $json);
-        return $json;
+
+        $this->lock('htmlified');
+        try {
+            $json = json_decode(
+                file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
+                true
+            );
+            foreach ($json as $keyword => $htmlified) {
+                apcu_store("htmlified_{$keyword}", $htmlified);
+            }
+            apcu_store('htmlified_all', $json);
+            apcu_store('htmlified_loaded', 1);
+        } finally {
+            $this->unlock('htmlified');
+        }
     }
 
     private function initialize_users() {
-        $this->lock('user');
+        if (apcu_fetch('user_loaded')) {
+            return;
+        }
+
         $json = json_decode(
             file_get_contents('/home/isucon/webapp/php/lib/Isuda/user.json'),
             true
         );
-        $users_by_id = $users_by_name = [];
         foreach ($json as $user) {
-            $users_by_id[$user['id']] = $user;
-            $users_by_name[$user['name']] = $user;
+            apcu_store("user_id_{$user['id']}", $user);
+            apcu_store("user_name_{$user['name']}", $user);
         }
-        apcu_store('users_by_id', $users_by_id);
-        apcu_store('users_by_name', $users_by_name);
-        $this->unlock('user');
-        return [$users_by_id, $users_by_name];
+        apcu_store('user_loaded', 1);
     }
 };
 $container['view'] = function ($container) {
@@ -327,13 +355,15 @@ $app->get('/', function (Request $req, Response $c) {
     //     "LIMIT $PER_PAGE ".
     //     "OFFSET $offset"
     // );
-    $all_entries = $this->get_entries();
-    $total_entries = count($all_entries);
+    $entries = [];
+    $all_keywords = $this->get_entry_index();
+    $total_entries = count($all_keywords);
     $offset = $total_entries - ($page * $PER_PAGE);
-    $entries = array_slice($all_entries, $offset, $PER_PAGE);
-    foreach ($entries as &$entry) {
+    foreach (array_slice($all_keywords, $offset, $PER_PAGE) as $keyword) {
+        $entry = $this->get_entry($keyword);
         $entry['html']  = $this->htmlify($entry);
-        $entry['stars'] = $this->load_stars($entry['keyword']);
+        $entry['stars'] = $this->load_stars($keyword);
+        $entries[] = $entry;
     }
     unset($entry);
 
@@ -508,21 +538,13 @@ $app->get('/update', function (Request $req, Response $c) {
     if (empty($this->get_entry($keyword))) {
         return $c->withStatus(400);
     }
-    $entry = $this->get_entry($keyword);
-    if (empty($entry)) {
-        return $c->withStatus(400);
-    }
+    return render_json($c, [$keyword => 'ok']);
 
     apcu_delete("htmlified_{$keyword}");
     $this->save_htmlified($keyword, $this->htmlify($entry));
 
     return render_json($c, [$keyword => 'ok']);
 });
-
-
-
-
-
 
 
 
