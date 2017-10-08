@@ -61,3 +61,36 @@ function render_json(\Slim\Http\Response $r, $object) {
   $r->getBody()->write(json_encode($object));
   return $r;
 }
+
+class StopWatch {
+	private static $instance;
+
+	private $logPath;
+
+	private $lastRecordTime;
+
+	private function __construct($log_file_path = null) {
+		$this->logPath = $log_file_path ? $log_file_path : ('/tmp/exectime_' . date('YmdHi') . '.log');
+		$this->lastRecordTime = self::now();
+	}
+
+	public static function instance() {
+		if (empty(self::$instance)) {
+				self::$instance = new self;
+		}
+		return self::$instance;
+	}
+
+	public function record($label = '-') {
+		$now = self::now();
+		$elapsed = (int)(($now - $this->lastRecordTime) * 100000000);
+		$this->lastRecordTime = $now;
+
+		file_put_contents($this->logPath, "{$label} : {$elapsed}\n", FILE_APPEND);
+	}
+
+	private static function now() {
+		list($usec, $sec) = explode(' ', microtime());
+		return (float)($sec + $usec);
+	}
+}
