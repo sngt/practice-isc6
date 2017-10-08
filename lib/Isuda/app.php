@@ -43,13 +43,6 @@ $container = new class extends \Slim\Container {
         file_put_contents('/home/isucon/.local/php/var/log/debug.log', "{$message}\n", FILE_APPEND);
     }
 
-    public function initialize() {
-        apcu_clear_cache();
-        $this->initialize_entries();
-        $this->initialize_htmlified();
-        $this->initialize_users();
-    }
-
     public function get_entry($keyword) {
         return $this->get_entries()[$keyword] ?? null;
     }
@@ -78,13 +71,7 @@ $container = new class extends \Slim\Container {
             $entries = $this->get_entries();
             if (isset($entries[$keyword])) {
                 unset($entries[$keyword]);
-                // apcu_delete("htmlified_{$keyword}");
             } else {
-                // foreach ($entries as $targetKeyword => $targetEntry) {
-                //     if (mb_strpos($targetEntry['description'], $keyword) !== false) {
-                //         apcu_delete("htmlified_{$targetKeyword}");
-                //     }
-                // }
             }
 
             $entries[$keyword] = $entry;
@@ -111,7 +98,7 @@ $container = new class extends \Slim\Container {
     }
 
     public function lock($key) {
-        static $INTERVAL = 10;
+        static $INTERVAL = 1;
         static $TRIAL_TIMES = 50000;
 
         $count = 0;
@@ -172,6 +159,7 @@ $this->debug_log($keyword);
         }
         $htmlified = nl2br($content, true);
         apcu_store("htmlified_{$keyword}", $htmlified);
+        $this->save_htmlified($keyword, $htmlified);
         return $htmlified;
     }
 
@@ -213,6 +201,28 @@ $this->debug_log($keyword);
         return $users[$name] ?? null;
     }
 
+    public function save_htmlified($keyword, $htmlified) {
+        $this->lock('htmlfied');
+        try {
+            $all = apcu_fetch('htmlified_all');
+            if (empty($all)) {
+                return;
+            }
+            $all[$keyword] = $htmlified;
+            apcu_store('htmlified_all', $all);
+            file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($all));
+        } finally {
+            $this->unlock('htmlfied');
+        }
+    }
+
+    public function initialize() {
+        apcu_clear_cache();
+        $this->initialize_entries();
+        $this->initialize_htmlified();
+        $this->initialize_users();
+    }
+
     private function initialize_entries() {
         $this->lock('entry');
         $json = json_decode(
@@ -228,7 +238,7 @@ $this->debug_log($keyword);
         return $entries;
     }
 
-    public function initialize_htmlified() {
+    private function initialize_htmlified() {
         $json = json_decode(
             file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
             true
@@ -236,6 +246,7 @@ $this->debug_log($keyword);
         foreach ($json as $keyword => $htmlified) {
             apcu_store("htmlified_{$keyword}", $htmlified);
         }
+        apcu_store('htmlified_all', $json);
         return $json;
     }
 
@@ -491,22 +502,20 @@ $app->post('/stars', function (Request $req, Response $c) {
 
 
 
-$app->get('/create', function (Request $req, Response $c) {
-    set_time_limit(240);
-    $htmlified = $this->initialize_htmlified();
-    $target = [
-        '機動戦士ガンダムSEED DESTINY ASTRAY', 'アグリッパ2世', '八頭町', '近藤勇五郎', '伊予市駅', '武部勤', '早島駅', '哲西町',
-    ];
-    foreach ($target as $keyword) {
-        $entry = $this->get_entry($keyword);
-        if ($entry) {
-            apcu_delete("htmlified_{$keyword}");
-            $htmlified[$keyword] = $this->htmlify($entry);
-        }
+$app->get('/update', function (Request $req, Response $c) {
+    $keyword = $req->getParams()['keyword'];
+    if (empty($this->get_entry($keyword))) {
+        return $c->withStatus(400);
+    }
+    $entry = $this->get_entry($keyword);
+    if (empty($entry)) {
+        return $c->withStatus(400);
     }
 
-    file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($htmlified));
-    return render_json($c, ['result' => 'ok']);
+    apcu_delete("htmlified_{$keyword}");
+    $this->save_htmlified($keyword, $this->htmlify($entry));
+
+    return render_json($c, [$keyword => 'ok']);
 });
 
 
