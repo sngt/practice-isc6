@@ -63,34 +63,38 @@ function render_json(\Slim\Http\Response $r, $object) {
 }
 
 class StopWatch {
-	private static $instance;
+    private static $instance;
 
-	private $logPath;
+    private $log_path;
 
-	private $lastRecordTime;
+    private $last_record_time;
 
-	private function __construct($log_file_path = null) {
-		$this->logPath = $log_file_path ? $log_file_path : ('/tmp/exectime_' . date('YmdHi') . '.log');
-		$this->lastRecordTime = self::now();
-	}
+    private function __construct($log_file_path = null) {
+        $this->log_path = $log_file_path ? $log_file_path : ('/tmp/exectime_' . date('YmdH') . '.log');
+        $this->last_record_time = self::now();
+    }
 
-	public static function instance() {
-		if (empty(self::$instance)) {
-				self::$instance = new self;
-		}
-		return self::$instance;
-	}
+    public static function instance() {
+        if (empty(self::$instance)) {
+                self::$instance = new self;
+        }
+        return self::$instance;
+    }
 
-	public function record($label = '-') {
-		$now = self::now();
-		$elapsed = (int)(($now - $this->lastRecordTime) * 100000000);
-		$this->lastRecordTime = $now;
+    public function start() {
+        $this->last_record_time = self::now();
+    }
 
-		file_put_contents($this->logPath, "{$label} : {$elapsed}\n", FILE_APPEND);
-	}
+    public function record($label = '-') {
+        $now = self::now();
+        $elapsed = $now - $this->last_record_time;
+        $this->last_record_time = $now;
 
-	private static function now() {
-		list($usec, $sec) = explode(' ', microtime());
-		return (float)($sec + $usec);
-	}
+        file_put_contents($this->log_path, "{$label} : {$elapsed}\n", FILE_APPEND);
+    }
+
+    private static function now() {
+        list($usec, $sec) = explode(' ', microtime());
+        return (float)($sec + $usec);
+    }
 }
