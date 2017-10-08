@@ -122,7 +122,7 @@ $container = new class extends \Slim\Container {
         if ($cached = apcu_fetch("htmlified_{$keyword}")) {
             return $cached;
         }
-$this->debug_log($keyword);
+
         $content = $entry['description'];
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
@@ -208,6 +208,7 @@ $this->debug_log($keyword);
             if (empty($all)) {
                 return;
             }
+$this->debug_log($keyword);
             $all[$keyword] = $htmlified;
             apcu_store('htmlified_all', $all);
             file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($all));
