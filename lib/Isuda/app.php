@@ -276,7 +276,7 @@ $app->get('/initialize', function (Request $req, Response $c) {
 });
 
 $app->get('/', function (Request $req, Response $c) {
-    $PER_PAGE = 10;
+    static $PER_PAGE = 10;
     $page = $req->getQueryParams()['page'] ?? 1;
 
     // $offset = $PER_PAGE * ($page-1);
@@ -286,17 +286,19 @@ $app->get('/', function (Request $req, Response $c) {
     //     "LIMIT $PER_PAGE ".
     //     "OFFSET $offset"
     // );
-    $entries = [];
+
     $all_keywords = array_keys($this->get_entry_index());
     $total_entries = count($all_keywords);
     $offset = $total_entries - ($page * $PER_PAGE);
-    foreach (array_slice($all_keywords, $offset, $PER_PAGE) as $keyword) {
-        $entry = $this->get_entry($keyword);
-        // $entry['html']  = $this->htmlify($entry['description']);
-        // $entry['stars'] = $this->load_stars($keyword);
-        $entries[] = $entry;
-    }
-    unset($entry);
+    $target_cache_keys = array_map(function ($keyword) {
+        return "entry_{$keyword}";
+    }, array_slice($all_keywords, $offset, $PER_PAGE));
+    $entries = apcu_fetch($target_cache_keys);
+    // foreach ($entries as &$entry) {
+    //     // $entry['html']  = $this->htmlify($entry['description']);
+    //     // $entry['stars'] = $this->load_stars($keyword);
+    // }
+    // unset($entry);
 
     // $total_entries = $this->dbh->select_one(
     //     'SELECT COUNT(*) FROM entry'
