@@ -290,10 +290,11 @@ $app->get('/', function (Request $req, Response $c) {
     $all_keywords = array_keys($this->get_entry_index());
     $total_entries = count($all_keywords);
     $offset = $total_entries - ($page * $PER_PAGE);
-    $target_cache_keys = array_map(function ($keyword) {
-        return "entry_{$keyword}";
+
+    $entries = array_map(function ($keyword) {
+        return $this->get_entry($keyword);
     }, array_slice($all_keywords, $offset, $PER_PAGE));
-    $entries = apcu_fetch($target_cache_keys);
+
     // foreach ($entries as &$entry) {
     //     // $entry['html']  = $this->htmlify($entry['description']);
     //     // $entry['stars'] = $this->load_stars($keyword);
