@@ -13,6 +13,6 @@ cat /var/log/nginx/access.log | awk '{
     counts[req]++;
 } END {
     for (req in res_time_sum) {
-        print req"\t"res_time_sum[req]"\t"counts[req];
+        print req"\t"res_time_sum[req]" / "counts[req]"\t= "(res_time_sum[req] / counts[req])"s";
     }
 }' | sort -n -k 3
