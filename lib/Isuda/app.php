@@ -14,7 +14,7 @@ function config($key) {
             'dsn'           => $_ENV['ISUDA_DSN']         ?? 'dbi:mysql:db=isuda',
             'db_user'       => $_ENV['ISUDA_DB_USER']     ?? 'isucon',
             'db_password'   => $_ENV['ISUDA_DB_PASSWORD'] ?? 'isucon',
-            'isutar_origin' => $_ENV['ISUTAR_ORIGIN']     ?? 'http://localhost:5001',
+            // 'isutar_origin' => $_ENV['ISUTAR_ORIGIN']     ?? 'http://localhost:5001',
             'isupam_origin' => $_ENV['ISUPAM_ORIGIN']     ?? 'http://localhost:5050',
         ];
     }
@@ -67,16 +67,28 @@ $container = new class extends \Slim\Container {
         return apcu_fetch("entry_{$keyword}") ?: null;
     }
 
-    public function get_quoted_keywords_sorted_by_char_length() {
+    public function get_all_keyword_regexps() {
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
         // );
+        if ($cached = apcu_fetch('all_keyword_regexp_list')) {
+            return $cached;
+        }
+
+        $regexps = [];
         $list = $this->dbh->select_all(
             'SELECT keyword FROM entry ORDER BY keyword_length DESC'
         );
-        return array_map(function ($data) {
-            return quotemeta($data['keyword']);
-        }, $list);
+        for ($i = 0; !empty($kwtmp = array_slice($list, 500 * $i, 500)); $i++) {
+            $quated = array_map(function ($data) {
+                return quotemeta($data['keyword']);
+            }, $kwtmp);
+            $re = implode('|', $quated);
+            $regexps[] = "/($re)/";
+        }
+
+        apcu_store('all_keyword_regexp_list', $regexps);
+        return $regexps;
     }
 
     public function set_entry($keyword, $description) {
@@ -124,11 +136,6 @@ $container = new class extends \Slim\Container {
             return '';
         }
 
-        static $keywords;
-        if (empty($keywords)) {
-            $keywords = $this->get_quoted_keywords_sorted_by_char_length();
-        }
-
         $kw2sha = [];
 
         // NOTE: avoid pcre limitation "regular expression is too large at offset"
@@ -139,9 +146,8 @@ $container = new class extends \Slim\Container {
         //         return $kw2sha[$kw] = "isuda_" . sha1($kw);
         //     }, $content);
         // }
-        for ($i = 0; !empty($kwtmp = array_slice($keywords, 500 * $i, 500)); $i++) {
-            $re = implode('|', $kwtmp);
-            preg_replace_callback("/($re)/", function ($m) use (&$kw2sha) {
+        foreach ($this->get_all_keyword_regexps() as $regexp) {
+            preg_replace_callback($regexp, function ($m) use (&$kw2sha) {
                 $kw = $m[1];
                 return $kw2sha[$kw] = "isuda_" . sha1($kw);
             }, $content);
@@ -345,8 +351,7 @@ $app->post('/save-keyword-internal', function (Request $req, Response $c) {
     $user_id = $data['user_id'];
     $description = $data['description'];
 
-
-    $entry = $this->dbh->select_row('SELECT * FROM entry WHERE keyword = ?', $keyword);
+    $entry = $this->dbh->select_row('SELECT id, description FROM entry WHERE keyword = ?', $keyword);
     if ($entry) {
         if ($entry['description'] === $description) {
             return render_json($c, '');
@@ -360,6 +365,7 @@ $app->post('/save-keyword-internal', function (Request $req, Response $c) {
         'INSERT INTO entry (author_id, keyword, keyword_length, description, html, created_at, updated_at)'
         .' VALUES (?, ?, CHAR_LENGTH(keyword), ?, ?, NOW(), NOW())'
     , $user_id, $keyword, $description, $this->htmlify($description));
+    apcu_delete('all_keyword_regexp_list');
 
     // $this->dbh->query(
     //     'INSERT INTO entry (author_id, keyword, description, created_at, updated_at)'
