@@ -2,6 +2,8 @@
 require __DIR__ . '/vendor/autoload.php';
 require __DIR__ . '/lib/glue.php';
 
+require __DIR__ . '/vendor/predis/predis/autoload.php';
+
 // $_ENV['ISUDA_DSN'] = 'mysql:host=127.0.0.1;dbname=isuda';
 $_ENV['PHP_TEMPLATE_PATH'] = __DIR__ . '/views';
 

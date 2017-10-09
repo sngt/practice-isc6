@@ -61,16 +61,6 @@ $container = new class extends \Slim\Container {
         apcu_delete("{$key}_lock");
     }
 
-    public function get_entry_index() {
-        StopWatch::instance()->record('fetching index');
-        if ($cached = apcu_fetch('entry_index')) {
-            StopWatch::instance()->record('fetched index');
-            return $cached;
-        }
-        $this->initialize_entries();
-        return apcu_fetch('entry_index');
-    }
-
     public function get_entry($keyword) {
         if ($cached = apcu_fetch("entry_{$keyword}")) {
             return $cached;
@@ -79,8 +69,21 @@ $container = new class extends \Slim\Container {
         return apcu_fetch("entry_{$keyword}") ?: null;
     }
 
+    public function count_keywords() {
+        $redis = $this->get_redis();
+        return $redis->zcount('entry', '-inf', '+inf');
+    }
+
+    public function get_latest_keywords($size = null, $offset = 0) {
+        $start = $offset;
+        $stop = ($size === null) ? -1 : ($offset + $size);
+
+        $redis = $this->get_redis();
+        return $redis->zrevrange('entry', $start, $stop);
+    }
+
     public function get_quoted_keywords_sorted_by_char_length() {
-        $keywords = array_values($this->get_entry_index());
+        $keywords = $this->get_latest_keywords();
         usort($keywords, function ($a, $b) {
             return mb_strlen($b) - mb_strlen($a);
         });
@@ -93,12 +96,9 @@ $container = new class extends \Slim\Container {
         $keyword = $entry['keyword'];
         $this->lock('entry');
         try {
-            $index = apcu_fetch('entry_index') ?:[];
-            if (isset($index[$keyword])) {
-                unset($index[$keyword]);
-            }
-            $index[$keyword] = $keyword;
-            apcu_store('entry_index', $index);
+            $redis = $this->get_redis();
+            $redis->zadd('entry', [$keyword => time()]);
+
             apcu_store("entry_{$keyword}", $entry);
         } finally {
             $this->unlock('entry');
@@ -108,13 +108,13 @@ $container = new class extends \Slim\Container {
     public function delete_entry($keyword) {
         $this->lock('entry');
         try {
-            $index = apcu_fetch('entry_index') ?:[];
-            if (empty($index($keyword))) {
+            if (empty(apcu_fetch("entry_{$keyword}"))) {
                 return false;
             }
 
-            unset($index[$keyword]);
-            apcu_store('entry_index', $index);
+            $redis = $this->get_redis();
+            $redis->zrem('entry', $keyword);
+
             apcu_delete("entry_{$keyword}");
         } finally {
             $this->unlock('entry');
@@ -122,16 +122,25 @@ $container = new class extends \Slim\Container {
         return true;
     }
 
-    public function htmlify($entry) {
-        if (empty($entry) || !isset($entry['keyword']) || !isset($entry['description'])) {
+    public function get_htmlfied($entry) {
+        if (empty($entry) || empty($entry['keyword']) || empty($entry['description'])) {
             return '';
         }
         $keyword = $entry['keyword'];
         if ($cached = apcu_fetch("htmlified_{$keyword}")) {
             return $cached;
         }
+        $htmlified = $this->htmlify($entry['description']);
+        apcu_store("htmlified_{$keyword}", $htmlified);
+        $this->debug_log($keyword);
+        return $htmlified;
+    }
 
-        $content = $entry['description'];
+    private function htmlify($content) {
+        if (empty($content)) {
+            return '';
+        }
+
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
         // );
@@ -165,10 +174,7 @@ $container = new class extends \Slim\Container {
 
             $content = preg_replace("/{$hash}/", $link, $content);
         }
-        $htmlified = nl2br($content, true);
-        apcu_store("htmlified_{$keyword}", $htmlified);
-        $this->debug_log($keyword);
-        return $htmlified;
+        return nl2br($content, true);
     }
 
     public function load_stars($keyword) {
@@ -199,27 +205,32 @@ $container = new class extends \Slim\Container {
         if ($cached = apcu_fetch("user_id_{$id}")) {
             return $cached;
         }
-        $this->initialize_users();
-        return apcu_fetch("user_id_{$id}") ?: null;
+        // $this->initialize_users();
+        // return apcu_fetch("user_id_{$id}") ?: null;
+        return null;
     }
 
     public function get_user_by_name($name) {
         if ($cached = apcu_fetch("user_name_{$name}")) {
             return $cached;
         }
-        $this->initialize_users();
-        return apcu_fetch("user_name_{$name}") ?: null;
+        // $this->initialize_users();
+        // return apcu_fetch("user_name_{$name}") ?: null;
+        return null;
     }
 
-    public function save_htmlified($keyword, $htmlified) {
+    public function update_htmlified($entry) {
         $this->lock('htmlfied');
         try {
             $all = apcu_fetch('htmlified_all');
             if (empty($all)) {
-                return;
+                $all = json_decode(
+                    file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
+                    true
+                );
             }
 
-            $all[$keyword] = $htmlified;
+            $all[$entry['keyword']] = $this->htmlify($entry['description']);
             apcu_store('htmlified_all', $all);
             file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($all));
         } finally {
@@ -227,16 +238,15 @@ $container = new class extends \Slim\Container {
         }
     }
 
-    public function initialize() {
-        if (apcu_add('initializing', 1, 3)) {
-            apcu_clear_cache();
-            $this->initialize_entries();
-            $this->initialize_htmlified();
-            $this->initialize_users();
+    private function get_redis() {
+        static $client;
+        if (empty($client)) {
+            $client = new \Predis\Client('unix:///tmp/redis.sock');
         }
+        return $client;
     }
 
-    private function initialize_entries() {
+    public function initialize_entries() {
         if (apcu_fetch('entry_loaded')) {
             return;
         }
@@ -247,19 +257,22 @@ $container = new class extends \Slim\Container {
                 file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
                 true
             );
-            $index = [];
+            $redis = $this->get_redis();
+            $redis->del('entry');
+
+            $members = [];
             foreach ($json as $entry) {
                 apcu_store("entry_{$entry['keyword']}", $entry);
-                $index[$entry['keyword']] = $entry['keyword'];
+                $members[$entry['keyword']] = time();
             }
-            apcu_store('entry_index', $index);
+            $redis->zadd('entry', $members);
             apcu_store('entry_loaded', 1);
         } finally {
             $this->unlock('entry');
         }
     }
 
-    private function initialize_htmlified() {
+    public function initialize_htmlified() {
         if (apcu_fetch('htmlified_loaded')) {
             return;
         }
@@ -273,14 +286,13 @@ $container = new class extends \Slim\Container {
             foreach ($json as $keyword => $htmlified) {
                 apcu_store("htmlified_{$keyword}", $htmlified);
             }
-            apcu_store('htmlified_all', $json);
             apcu_store('htmlified_loaded', 1);
         } finally {
             $this->unlock('htmlified');
         }
     }
 
-    private function initialize_users() {
+    public function initialize_users() {
         if (apcu_fetch('user_loaded')) {
             return;
         }
@@ -335,10 +347,33 @@ $app->get('/initialize', function (Request $req, Response $c) {
     // $this->dbh->query(
     //     'DELETE FROM entry WHERE id > 7101'
     // );
-    $this->initialize();
     // $origin = config('isutar_origin');
     // $url = "$origin/initialize";
     // file_get_contents($url);
+
+    // apcu_clear_cache();
+    exec('curl --silent -X GET http://localhost/initialize/htmlified > /dev/null &');
+    exec('curl --silent -X GET http://localhost/initialize/entry > /dev/null &');
+    exec('curl --silent -X GET http://localhost/initialize/user > /dev/null &');
+    sleep(3);
+    return render_json($c, [
+        'result' => 'ok',
+    ]);
+});
+$app->get('/initialize/user', function (Request $req, Response $c) {
+    $this->initialize_users();
+    return render_json($c, [
+        'result' => 'ok',
+    ]);
+});
+$app->get('/initialize/entry', function (Request $req, Response $c) {
+    $this->initialize_entries();
+    return render_json($c, [
+        'result' => 'ok',
+    ]);
+});
+$app->get('/initialize/htmlified', function (Request $req, Response $c) {
+    $this->initialize_htmlified();
     return render_json($c, [
         'result' => 'ok',
     ]);
@@ -356,12 +391,10 @@ $app->get('/', function (Request $req, Response $c) {
     //     "OFFSET $offset"
     // );
     $entries = [];
-    $all_keywords = $this->get_entry_index();
-    $total_entries = count($all_keywords);
-    $offset = $total_entries - ($page * $PER_PAGE);
-    foreach (array_slice($all_keywords, $offset, $PER_PAGE) as $keyword) {
+    $offset = ($page - 1) * $PER_PAGE;
+    foreach ($this->get_latest_keywords($PER_PAGE, $offset) as $keyword) {
         $entry = $this->get_entry($keyword);
-        $entry['html']  = $this->htmlify($entry);
+        $entry['html']  = $this->get_htmlfied($entry);
         $entry['stars'] = $this->load_stars($keyword);
         $entries[] = $entry;
     }
@@ -370,7 +403,7 @@ $app->get('/', function (Request $req, Response $c) {
     // $total_entries = $this->dbh->select_one(
     //     'SELECT COUNT(*) FROM entry'
     // );
-    $last_page = ceil($total_entries / $PER_PAGE);
+    $last_page = ceil($this->count_keywords() / $PER_PAGE);
     $pages = range(max(1, $page-5), min($last_page, $page+5));
 
     $this->view->render($c, 'index.twig', [ 'entries' => $entries, 'page' => $page, 'last_page' => $last_page, 'pages' => $pages, 'stash' => $this->get('stash') ]);
@@ -475,7 +508,7 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) {
     // , $keyword);
     $entry = $this->get_entry($keyword);
     if (empty($entry)) return $c->withStatus(404);
-    $entry['html'] = $this->htmlify($entry);
+    $entry['html'] = $this->get_htmlfied($entry);
     $entry['stars'] = $this->load_stars($entry['keyword']);
 
     return $this->view->render($c, 'keyword.twig', [
@@ -535,14 +568,12 @@ $app->post('/stars', function (Request $req, Response $c) {
 
 $app->get('/update', function (Request $req, Response $c) {
     $keyword = $req->getParams()['keyword'];
-    if (empty($this->get_entry($keyword))) {
+    $entry = $this->get_entry($keyword);
+    if (empty($entry)) {
         return $c->withStatus(400);
     }
-    return render_json($c, [$keyword => 'ok']);
 
-    apcu_delete("htmlified_{$keyword}");
-    $this->save_htmlified($keyword, $this->htmlify($entry));
-
+    $this->update_htmlified($entry);
     return render_json($c, [$keyword => 'ok']);
 });
 
