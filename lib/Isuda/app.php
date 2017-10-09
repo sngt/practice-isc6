@@ -7,8 +7,6 @@ use PDO;
 use PDOWrapper;
 use StopWatch;
 
-ini_set('memory_limit', '1G');
-
 function config($key) {
     static $conf;
     if ($conf === null) {
@@ -29,16 +27,16 @@ function config($key) {
 
 $container = new class extends \Slim\Container {
     public $dbh;
-    // public function __construct() {
-    //     parent::__construct();
-    //
-    //     $this->dbh = new PDOWrapper(new PDO(
-    //         $_ENV['ISUDA_DSN'],
-    //         $_ENV['ISUDA_DB_USER'] ?? 'isucon',
-    //         $_ENV['ISUDA_DB_PASSWORD'] ?? 'isucon',
-    //         [ PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4" ]
-    //     ));
-    // }
+    public function __construct() {
+        parent::__construct();
+
+        $this->dbh = new PDOWrapper(new PDO(
+            $_ENV['ISUDA_DSN'],
+            $_ENV['ISUDA_DB_USER'] ?? 'isucon',
+            $_ENV['ISUDA_DB_PASSWORD'] ?? 'isucon',
+            [ PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8mb4" ]
+        ));
+    }
 
     public function debug_log($message) {
         file_put_contents('/home/isucon/.local/php/var/log/debug.log', "{$message}\n", FILE_APPEND);
@@ -62,43 +60,43 @@ $container = new class extends \Slim\Container {
     }
 
     public function get_entry_index() {
-        StopWatch::instance()->record('fetching index');
-        if ($cached = apcu_fetch('entry_index')) {
-            StopWatch::instance()->record('fetched index');
-            return $cached;
-        }
-        $this->initialize_entries();
-        return apcu_fetch('entry_index');
+        return apcu_fetch('entry_index') ?: [];
     }
 
     public function get_entry($keyword) {
-        if ($cached = apcu_fetch("entry_{$keyword}")) {
-            return $cached;
-        }
-        $this->initialize_entries();
         return apcu_fetch("entry_{$keyword}") ?: null;
     }
 
     public function get_quoted_keywords_sorted_by_char_length() {
-        $keywords = array_values($this->get_entry_index());
-        usort($keywords, function ($a, $b) {
-            return mb_strlen($b) - mb_strlen($a);
-        });
-        return array_map(function ($keyword) {
-            return quotemeta($keyword);
-        }, $keywords);
+        // $keywords = $this->dbh->select_all(
+        //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
+        // );
+        $list = $this->dbh->select_all(
+            'SELECT keyword FROM entry ORDER BY keyword_length DESC'
+        );
+        return array_map(function ($data) {
+            return quotemeta($data['keyword']);
+        }, $list);
     }
 
-    public function set_entry($entry) {
-        $keyword = $entry['keyword'];
+    public function set_entry($keyword, $description) {
         $this->lock('entry');
         try {
-            $index = apcu_fetch('entry_index') ?:[];
+            $index = $this->get_entry_index();
             if (isset($index[$keyword])) {
                 unset($index[$keyword]);
             }
-            $index[$keyword] = $keyword;
+            $index[$keyword] = 1;
             apcu_store('entry_index', $index);
+
+            $entry = $this->get_entry($keyword);
+            if (empty($entry)) {
+                $entry = [
+                    'keyword' => $keyword,
+                    'html' => $this->htmlify($description),
+                    'stars' => [],
+                ];
+            }
             apcu_store("entry_{$keyword}", $entry);
         } finally {
             $this->unlock('entry');
@@ -108,33 +106,24 @@ $container = new class extends \Slim\Container {
     public function delete_entry($keyword) {
         $this->lock('entry');
         try {
-            $index = apcu_fetch('entry_index') ?:[];
+            $index = $this->get_entry_index();
             if (empty($index($keyword))) {
                 return false;
             }
 
             unset($index[$keyword]);
             apcu_store('entry_index', $index);
-            apcu_delete("entry_{$keyword}");
+            return true;
         } finally {
             $this->unlock('entry');
         }
-        return true;
     }
 
-    public function htmlify($entry) {
-        if (empty($entry) || !isset($entry['keyword']) || !isset($entry['description'])) {
+    public function htmlify($content) {
+        if (empty($content)) {
             return '';
         }
-        $keyword = $entry['keyword'];
-        if ($cached = apcu_fetch("htmlified_{$keyword}")) {
-            return $cached;
-        }
 
-        $content = $entry['description'];
-        // $keywords = $this->dbh->select_all(
-        //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
-        // );
         static $keywords;
         if (empty($keywords)) {
             $keywords = $this->get_quoted_keywords_sorted_by_char_length();
@@ -165,135 +154,71 @@ $container = new class extends \Slim\Container {
 
             $content = preg_replace("/{$hash}/", $link, $content);
         }
-        $htmlified = nl2br($content, true);
-        apcu_store("htmlified_{$keyword}", $htmlified);
-        $this->debug_log($keyword);
-        return $htmlified;
-    }
-
-    public function load_stars($keyword) {
-        // $keyword = rawurlencode($keyword);
-        // $origin = config('isutar_origin');
-        // $url = "{$origin}/stars?keyword={$keyword}";
-        // $ua = new \GuzzleHttp\Client;
-        // $res = $ua->request('GET', $url)->getBody();
-        // $data = json_decode($res, true);
-        //
-        // return $data['stars'];
-        return apcu_fetch("starts_{$keyword}") ?: [];
+        return nl2br($content, true);
     }
 
     public function add_star($keyword, $user_name) {
-        $cache_key = "starts_{$keyword}";
+        $cache_key = "entry_{$keyword}";
         $this->lock($cache_key);
         try {
-            $stars = $this->load_stars($keyword);
-            $stars[] = ['keyword' => $keyword, 'user_name' => $user_name];
-            apcu_store($cache_key, $stars);
+            $entry = $this->get_entry($keyword);
+            if (empty($entry)) {
+                return false;
+            }
+            $entry['stars'][] = ['keyword' => $keyword, 'user_name' => $user_name];
+            apcu_store($cache_key, $entry);
+            return true;
         } finally {
             $this->unlock($cache_key);
         }
     }
 
     public function get_user($id) {
-        if ($cached = apcu_fetch("user_id_{$id}")) {
-            return $cached;
-        }
-        $this->initialize_users();
         return apcu_fetch("user_id_{$id}") ?: null;
     }
 
     public function get_user_by_name($name) {
-        if ($cached = apcu_fetch("user_name_{$name}")) {
-            return $cached;
-        }
-        $this->initialize_users();
         return apcu_fetch("user_name_{$name}") ?: null;
-    }
-
-    public function save_htmlified($keyword, $htmlified) {
-        $this->lock('htmlfied');
-        try {
-            $all = apcu_fetch('htmlified_all');
-            if (empty($all)) {
-                return;
-            }
-
-            $all[$keyword] = $htmlified;
-            apcu_store('htmlified_all', $all);
-            file_put_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json', json_encode($all));
-        } finally {
-            $this->unlock('htmlfied');
-        }
     }
 
     public function initialize() {
         if (apcu_add('initializing', 1, 3)) {
+            ini_set('memory_limit', '1G');
             apcu_clear_cache();
-            $this->initialize_entries();
-            $this->initialize_htmlified();
             $this->initialize_users();
+            $this->initialize_entries();
         }
     }
 
     private function initialize_entries() {
-        if (apcu_fetch('entry_loaded')) {
-            return;
-        }
+        static $INITIAL_MAX_ID = 7101;
 
         $this->lock('entry');
         try {
-            $json = json_decode(
-                file_get_contents('/home/isucon/webapp/php/lib/Isuda/entry.json'),
-                true
-            );
             $index = [];
-            foreach ($json as $entry) {
+            $entries = $this->dbh->select_all('SELECT id, keyword, html FROM entry ORDER BY id');
+            foreach ($entries as $entry) {
+                $id = $entry['id'];
+                unset($entry['id']);
+                $entry['stars'] = [];
                 apcu_store("entry_{$entry['keyword']}", $entry);
-                $index[$entry['keyword']] = $entry['keyword'];
+
+                if ($id <= $INITIAL_MAX_ID) {
+                    $index[$entry['keyword']] = 1;
+                }
             }
             apcu_store('entry_index', $index);
-            apcu_store('entry_loaded', 1);
         } finally {
             $this->unlock('entry');
         }
     }
 
-    private function initialize_htmlified() {
-        if (apcu_fetch('htmlified_loaded')) {
-            return;
-        }
-
-        $this->lock('htmlified');
-        try {
-            $json = json_decode(
-                file_get_contents('/home/isucon/webapp/php/lib/Isuda/htmlified.json'),
-                true
-            );
-            foreach ($json as $keyword => $htmlified) {
-                apcu_store("htmlified_{$keyword}", $htmlified);
-            }
-            apcu_store('htmlified_all', $json);
-            apcu_store('htmlified_loaded', 1);
-        } finally {
-            $this->unlock('htmlified');
-        }
-    }
-
     private function initialize_users() {
-        if (apcu_fetch('user_loaded')) {
-            return;
-        }
-
-        $json = json_decode(
-            file_get_contents('/home/isucon/webapp/php/lib/Isuda/user.json'),
-            true
-        );
-        foreach ($json as $user) {
+        $users = $this->dbh->select_all('SELECT id, name, salt, password FROM user ORDER BY id');
+        foreach ($users as $user) {
             apcu_store("user_id_{$user['id']}", $user);
             apcu_store("user_name_{$user['name']}", $user);
         }
-        apcu_store('user_loaded', 1);
     }
 };
 $container['view'] = function ($container) {
@@ -356,13 +281,13 @@ $app->get('/', function (Request $req, Response $c) {
     //     "OFFSET $offset"
     // );
     $entries = [];
-    $all_keywords = $this->get_entry_index();
+    $all_keywords = array_keys($this->get_entry_index());
     $total_entries = count($all_keywords);
     $offset = $total_entries - ($page * $PER_PAGE);
     foreach (array_slice($all_keywords, $offset, $PER_PAGE) as $keyword) {
         $entry = $this->get_entry($keyword);
-        $entry['html']  = $this->htmlify($entry);
-        $entry['stars'] = $this->load_stars($keyword);
+        // $entry['html']  = $this->htmlify($entry['description']);
+        // $entry['stars'] = $this->load_stars($keyword);
         $entries[] = $entry;
     }
     unset($entry);
@@ -391,11 +316,51 @@ $app->post('/keyword', function (Request $req, Response $c) {
     if (is_spam_contents($description) || is_spam_contents($keyword)) {
         return $c->withStatus(400)->write('SPAM!');
     }
-    $this->set_entry([
-        'author_id' => $user_id,
-        'keyword' => $keyword,
-        'description' => $description
-    ]);
+    $this->set_entry($keyword, $description);
+
+    $entry_save_delegation = [
+        'user_id' => $user_id,
+        'description' => $description,
+    ];
+    apcu_store("entry_delegation_{$keyword}", $entry_save_delegation);
+
+    $delegation_command = '/usr/bin/curl --silent -X POST http://127.0.0.1:5000/save-keyword-internal'
+        . ' --data-urlencode \'keyword=' . str_replace("'", '\'', $keyword) .'\' > /dev/null &';
+    exec($delegation_command);
+
+    return $c->withRedirect('/');
+})->add($mw['authenticate'])->add($mw['set_name']);
+
+$app->post('/save-keyword-internal', function (Request $req, Response $c) {
+    $keyword = $req->getParams()['keyword'];
+    if (empty($keyword)) {
+        return $c->withStatus(400)->write("'keyword' required");
+    }
+
+    $data = apcu_fetch("entry_delegation_{$keyword}");
+    if (empty($data)) {
+        return $c->withStatus(400)->write("delegation data not found: {$keyword}");
+    }
+
+    $user_id = $data['user_id'];
+    $description = $data['description'];
+
+
+    $entry = $this->dbh->select_row('SELECT * FROM entry WHERE keyword = ?', $keyword);
+    if ($entry) {
+        if ($entry['description'] === $description) {
+            return render_json($c, '');
+        }
+        $this->dbh->query(
+            'UPDATE entry SET description = ?, html = ?, updated_at = NOW() WHERE id = ?'
+        , $description, $this->htmlify($description), $entry['id']);
+        return render_json($c, '');
+    }
+    $this->dbh->query(
+        'INSERT INTO entry (author_id, keyword, keyword_length, description, html, created_at, updated_at)'
+        .' VALUES (?, ?, CHAR_LENGTH(keyword), ?, ?, NOW(), NOW())'
+    , $user_id, $keyword, $description, $this->htmlify($description));
+
     // $this->dbh->query(
     //     'INSERT INTO entry (author_id, keyword, description, created_at, updated_at)'
     //     .' VALUES (?, ?, ?, NOW(), NOW())'
@@ -403,8 +368,8 @@ $app->post('/keyword', function (Request $req, Response $c) {
     //     .' author_id = ?, keyword = ?, description = ?, updated_at = NOW()'
     // , $user_id, $keyword, $description, $user_id, $keyword, $description);
 
-    return $c->withRedirect('/');
-})->add($mw['authenticate'])->add($mw['set_name']);
+    return render_json($c, '');
+});
 
 $app->get('/register', function (Request $req, Response $c) {
     return $this->view->render($c, 'authenticate.twig', [
@@ -475,8 +440,8 @@ $app->get('/keyword/{keyword}', function (Request $req, Response $c) {
     // , $keyword);
     $entry = $this->get_entry($keyword);
     if (empty($entry)) return $c->withStatus(404);
-    $entry['html'] = $this->htmlify($entry);
-    $entry['stars'] = $this->load_stars($entry['keyword']);
+    // $entry['html'] = $this->htmlify($entry['description']);
+    // $entry['stars'] = $this->load_stars($entry['keyword']);
 
     return $this->view->render($c, 'keyword.twig', [
         'entry' => $entry, 'stash' => $this->get('stash')
@@ -512,40 +477,19 @@ function is_spam_contents($content) {
 }
 
 // From isutar
-$app->get('/stars', function (Request $req, Response $c) {
-    $keyword = $req->getParams()['keyword'];
-    return render_json($c, [
-        'stars' => $this->load_stars($keyword),
-    ]);
-});
+// $app->get('/stars', function (Request $req, Response $c) {
+//     $keyword = $req->getParams()['keyword'];
+//     return render_json($c, [
+//         'stars' => $this->load_stars($keyword),
+//     ]);
+// });
 $app->post('/stars', function (Request $req, Response $c) {
-    $keyword = $req->getParams()['keyword'];
-    if (empty($this->get_entry($keyword))) {
+    $params = $req->getParams();
+    if ($this->add_star($params['keyword'], $params['user'])) {
+        return render_json($c, ['result' => 'ok']);
+    } else {
         return $c->withStatus(404);
     }
-
-    $this->add_star($keyword, $req->getParams()['user']);
-
-    return render_json($c, [
-        'result' => 'ok',
-    ]);
 });
-
-
-
-$app->get('/update', function (Request $req, Response $c) {
-    $keyword = $req->getParams()['keyword'];
-    if (empty($this->get_entry($keyword))) {
-        return $c->withStatus(400);
-    }
-    return render_json($c, [$keyword => 'ok']);
-
-    apcu_delete("htmlified_{$keyword}");
-    $this->save_htmlified($keyword, $this->htmlify($entry));
-
-    return render_json($c, [$keyword => 'ok']);
-});
-
-
 
 $app->run();

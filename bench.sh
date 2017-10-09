@@ -3,7 +3,7 @@ echo -n '' | tee /var/log/nginx/error.log
 echo -n '' | tee /home/isucon/.local/php/var/log/debug.log
 
 cd /home/isucon/isucon6q/
-./isucon6q-bench | tee /tmp/bench_result
+./isucon6q-bench
 
 cat /var/log/nginx/access.log | awk '{
     gsub(/(\?[^\?]+)$/, "", $4);
@@ -16,8 +16,3 @@ cat /var/log/nginx/access.log | awk '{
         print req"\t"res_time_sum[req]"\t"counts[req];
     }
 }' | sort -n -k 3
-
-cat /tmp/bench_result | /home/isucon/webapp/php/update_keyword.js
-for kw in $(cat /home/isucon/.local/php/var/log/debug.log); do
-    curl -X GET --data-urlencode "keyword=${kw}" http://localhost/update
-done
