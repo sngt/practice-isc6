@@ -22,7 +22,7 @@ cat /var/log/nginx/access.log | awk '{
 }' | sort -n -k 3
 
 for keyword in `cat /tmp/bench_result | grep '{"pass":' | ${WORK_DIR}/extract.php`; do
-    curl -X POST --data-urlencode="keyword=${keyword}"
+    curl -X POST http://127.0.0.1:5000/htmlify --data-urlencode "keyword=${keyword}"
 done
 
 # sudo rm -rf /tmp/nginx/*; sudo systemctl restart nginx
