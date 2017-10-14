@@ -196,6 +196,14 @@ $container = new class extends \Slim\Container {
         }
     }
 
+    private function initialize_users() {
+        $users = $this->dbh->select_all('SELECT id, name, salt, password FROM user ORDER BY id');
+        foreach ($users as $user) {
+            apcu_store("user_id_{$user['id']}", $user);
+            apcu_store("user_name_{$user['name']}", $user);
+        }
+    }
+
     private function initialize_entries() {
         static $INITIAL_MAX_ID = 7101;
 
@@ -218,14 +226,6 @@ $container = new class extends \Slim\Container {
             $this->unlock('entry');
         }
     }
-
-    private function initialize_users() {
-        $users = $this->dbh->select_all('SELECT id, name, salt, password FROM user ORDER BY id');
-        foreach ($users as $user) {
-            apcu_store("user_id_{$user['id']}", $user);
-            apcu_store("user_name_{$user['name']}", $user);
-        }
-    }
 };
 $container['view'] = function ($container) {
     $view = new \Slim\Views\Twig($_ENV['PHP_TEMPLATE_PATH'], []);
@@ -243,12 +243,13 @@ $mw = [];
 $mw['set_name'] = function ($req, $c, $next) {
     $user_id = $_SESSION['user_id'] ?? null;
     if (isset($user_id)) {
-        $this->get('stash')['user_id'] = $user_id;
+        $stash = &$this->get('stash');
+        $stash['user_id'] = $user_id;
         // $this->get('stash')['user_name'] = $this->dbh->select_one(
         //     'SELECT name FROM user WHERE id = ?'
         //     , $user_id);
-        $this->get('stash')['user_name'] = $this->get_user($user_id)['name'];
-        if (!isset($this->get('stash')['user_name'])) {
+        $stash['user_name'] = $this->get_user($user_id)['name'];
+        if (!isset($stash['user_name'])) {
             return $c->withStatus(403);
         }
     }
@@ -306,7 +307,6 @@ $app->get('/', function (Request $req, Response $c) {
     // );
     $last_page = ceil($total_entries / $PER_PAGE);
     $pages = range(max(1, $page-5), min($last_page, $page+5));
-
     $this->view->render($c, 'index.twig', [ 'entries' => $entries, 'page' => $page, 'last_page' => $last_page, 'pages' => $pages, 'stash' => $this->get('stash') ]);
 })->add($mw['set_name'])->setName('/');
 
@@ -333,7 +333,7 @@ $app->post('/keyword', function (Request $req, Response $c) {
     ];
     apcu_store("entry_delegation_{$keyword}", $entry_save_delegation);
 
-    $delegation_command = '/usr/bin/curl --silent -X POST http://127.0.0.1:5000/save-keyword-internal'
+    $delegation_command = '/usr/bin/curl --silent -X POST http://127.0.0.1/save-keyword-internal'
         . ' --data-urlencode \'keyword=' . str_replace("'", '\'', $keyword) .'\' > /dev/null &';
     exec($delegation_command);
 
@@ -356,18 +356,21 @@ $app->post('/save-keyword-internal', function (Request $req, Response $c) {
 
     $entry = $this->dbh->select_row('SELECT id, description FROM entry WHERE keyword = ?', $keyword);
     if ($entry) {
-        if ($entry['description'] === $description) {
-            return render_json($c, '');
-        }
+        // if ($entry['description'] === $description) {
+        //     return render_json($c, '');
+        // }
         $this->dbh->query(
             'UPDATE entry SET description = ?, html = ?, updated_at = NOW() WHERE id = ?'
         , $description, $this->htmlify($description), $entry['id']);
         return render_json($c, '');
     }
+
+    $cached = apcu_fetch("entry_{$keyword}");
+    $html = $cached ? $cached['html'] : $this->htmlify($description);
     $this->dbh->query(
         'INSERT INTO entry (author_id, keyword, keyword_length, description, html, created_at, updated_at)'
         .' VALUES (?, ?, CHAR_LENGTH(keyword), ?, ?, NOW(), NOW())'
-    , $user_id, $keyword, $description, $this->htmlify($description));
+    , $user_id, $keyword, $description, $html);
     apcu_delete('all_keyword_regexp_list');
 
     // $this->dbh->query(
