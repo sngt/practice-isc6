@@ -504,8 +504,8 @@ $app->post('/stars', function (Request $req, Response $c) {
 });
 
 $app->post('/htmlify', function (Request $req, Response $c) {
-    $params = $req->getParams();
-    if (empty($params['keyword'])) {
+    $keyword = $req->getParams()['keyword'];
+    if (empty($keyword)) {
         return $c->withStatus(400);
     }
     $entry = $this->dbh->select_row('SELECT id, description FROM entry WHERE keyword = ?', $keyword);
@@ -514,8 +514,8 @@ $app->post('/htmlify', function (Request $req, Response $c) {
     }
     $this->dbh->query(
         'UPDATE entry SET html = ?, updated_at = NOW() WHERE id = ?'
-    , $this->htmlify($description), $entry['id']);
-    return render_json($c, '');
+    , $this->htmlify($entry['description']), $entry['id']);
+    return render_json($c, 'ok');
 });
 
 $app->run();
