@@ -242,13 +242,12 @@ $mw = [];
 $mw['set_name'] = function ($req, $c, $next) {
     $user_id = $_SESSION['user_id'] ?? null;
     if (isset($user_id)) {
-        $stash = &$this->get('stash');
-        $stash['user_id'] = $user_id;
+        $this->get('stash')['user_id'] = $user_id;
         // $this->get('stash')['user_name'] = $this->dbh->select_one(
         //     'SELECT name FROM user WHERE id = ?'
         //     , $user_id);
-        $stash['user_name'] = $this->get_user($user_id)['name'];
-        if (!isset($stash['user_name'])) {
+        $this->get('stash')['user_name'] = $this->get_user($user_id)['name'];
+        if (!isset($this->get('stash')['user_name'])) {
             return $c->withStatus(403);
         }
     }
