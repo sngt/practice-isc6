@@ -212,14 +212,13 @@ $container = new class extends \Slim\Container {
             $index = [];
             $entries = $this->dbh->select_all('SELECT id, keyword, html FROM entry ORDER BY id');
             foreach ($entries as $entry) {
-                $id = $entry['id'];
-                unset($entry['id']);
-                $entry['stars'] = [];
-                apcu_store("entry_{$entry['keyword']}", $entry);
-
-                if ($id <= $INITIAL_MAX_ID) {
+                if ($entry['id'] <= $INITIAL_MAX_ID) {
                     $index[$entry['keyword']] = 1;
                 }
+                unset($entry['id']);
+
+                $entry['stars'] = [];
+                apcu_store("entry_{$entry['keyword']}", $entry);
             }
             apcu_store('entry_index', $index);
         } finally {
@@ -359,9 +358,9 @@ $app->post('/save-keyword-internal', function (Request $req, Response $c) {
         // if ($entry['description'] === $description) {
         //     return render_json($c, '');
         // }
-        $this->dbh->query(
-            'UPDATE entry SET description = ?, html = ?, updated_at = NOW() WHERE id = ?'
-        , $description, $this->htmlify($description), $entry['id']);
+        // $this->dbh->query(
+        //     'UPDATE entry SET description = ?, html = ?, updated_at = NOW() WHERE id = ?'
+        // , $description, $this->htmlify($description), $entry['id']);
         return render_json($c, '');
     }
 
@@ -502,6 +501,21 @@ $app->post('/stars', function (Request $req, Response $c) {
     } else {
         return $c->withStatus(404);
     }
+});
+
+$app->post('/htmlify', function (Request $req, Response $c) {
+    $params = $req->getParams();
+    if (empty($params['keyword'])) {
+        return $c->withStatus(400);
+    }
+    $entry = $this->dbh->select_row('SELECT id, description FROM entry WHERE keyword = ?', $keyword);
+    if (empty($entry)) {
+        return $c->withStatus(400);
+    }
+    $this->dbh->query(
+        'UPDATE entry SET html = ?, updated_at = NOW() WHERE id = ?'
+    , $this->htmlify($description), $entry['id']);
+    return render_json($c, '');
 });
 
 $app->run();
