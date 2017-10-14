@@ -14,10 +14,5 @@ foreach ($result['messages'] as $message) {
         continue;
     }
 
-    $curl = curl_init('http://127.0.0.1:5000/htmlify');
-    curl_setopt($curl, CURLOPT_POST, true);
-    curl_setopt($curl, CURLOPT_POSTFIELDS, http_build_query(['keyword' => $match['keyword']]));
-    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-    $response = curl_exec($curl);
-    curl_close($curl);
+    echo "{$match['keyword']}\n";
 }

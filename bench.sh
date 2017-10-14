@@ -1,6 +1,10 @@
-echo -n '' | sudo tee /var/log/nginx/access.log
-echo -n '' | sudo tee /var/log/nginx/error.log
+sudo chmod 666 /var/log/nginx/access.log /var/log/nginx/error.log
+
+echo -n '' | tee /var/log/nginx/access.log
+echo -n '' | tee /var/log/nginx/error.log
 echo -n '' | tee /home/isucon/.local/php/var/log/debug.log
+
+WORK_DIR=$(cd $(dirname ${0}); pwd)
 
 cd /home/isucon/isucon6q/
 ./isucon6q-bench | tee /tmp/bench_result
@@ -17,7 +21,8 @@ cat /var/log/nginx/access.log | awk '{
     }
 }' | sort -n -k 3
 
-cd $(dirname ${0})
-cat /tmp/bench_result | grep '{"pass":' | ./update_html.php
+for keyword in `cat /tmp/bench_result | grep '{"pass":' | ${WORK_DIR}/extract.php`; do
+    curl -X POST --data-urlencode="keyword=${keyword}"
+done
 
 # sudo rm -rf /tmp/nginx/*; sudo systemctl restart nginx
