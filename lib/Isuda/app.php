@@ -6,6 +6,7 @@ use Slim\Http\Response;
 use PDO;
 use PDOWrapper;
 use StopWatch;
+use LockUtil;
 
 function config($key) {
     static $conf;
@@ -42,23 +43,6 @@ $container = new class extends \Slim\Container {
         file_put_contents('/home/isucon/.local/php/var/log/debug.log', "{$message}\n", FILE_APPEND);
     }
 
-    public function lock($key) {
-        static $INTERVAL = 10;
-        static $TRIAL_TIMES = 10000;
-
-        $count = 0;
-        while (apcu_add("{$key}_lock", 1, 1) !== true) {
-            if (++$count > $TRIAL_TIMES) {
-                throw new \Exception('dead lock');
-            }
-            usleep($INTERVAL);
-        }
-    }
-
-    public function unlock($key) {
-        apcu_delete("{$key}_lock");
-    }
-
     public function get_entry_index() {
         return apcu_fetch('entry_index') ?: [];
     }
@@ -92,7 +76,7 @@ $container = new class extends \Slim\Container {
     }
 
     public function set_entry($keyword, $description) {
-        $this->lock('entry');
+        LockUtil::lock('entry');
         try {
             $index = $this->get_entry_index();
             if (isset($index[$keyword])) {
@@ -111,12 +95,12 @@ $container = new class extends \Slim\Container {
             }
             apcu_store("entry_{$keyword}", $entry);
         } finally {
-            $this->unlock('entry');
+            LockUtil::unlock('entry');
         }
     }
 
     public function delete_entry($keyword) {
-        $this->lock('entry');
+        LockUtil::lock('entry');
         try {
             $index = $this->get_entry_index();
             if (empty($index($keyword))) {
@@ -127,7 +111,7 @@ $container = new class extends \Slim\Container {
             apcu_store('entry_index', $index);
             return true;
         } finally {
-            $this->unlock('entry');
+            LockUtil::unlock('entry');
         }
     }
 
@@ -165,7 +149,7 @@ $container = new class extends \Slim\Container {
 
     public function add_star($keyword, $user_name) {
         $cache_key = "entry_{$keyword}";
-        $this->lock($cache_key);
+        LockUtil::lock($cache_key);
         try {
             $entry = $this->get_entry($keyword);
             if (empty($entry)) {
@@ -175,7 +159,7 @@ $container = new class extends \Slim\Container {
             apcu_store($cache_key, $entry);
             return true;
         } finally {
-            $this->unlock($cache_key);
+            LockUtil::unlock($cache_key);
         }
     }
 
@@ -207,7 +191,7 @@ $container = new class extends \Slim\Container {
     private function initialize_entries() {
         static $INITIAL_MAX_ID = 7101;
 
-        $this->lock('entry');
+        LockUtil::lock('entry');
         try {
             $index = [];
             $entries = $this->dbh->select_all('SELECT id, keyword, html FROM entry ORDER BY id');
@@ -222,7 +206,7 @@ $container = new class extends \Slim\Container {
             }
             apcu_store('entry_index', $index);
         } finally {
-            $this->unlock('entry');
+            LockUtil::unlock('entry');
         }
     }
 };

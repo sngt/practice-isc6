@@ -63,26 +63,16 @@ function render_json(\Slim\Http\Response $r, $object) {
 }
 
 class StopWatch {
-    private static $instance;
-
     private $log_path;
-
     private $last_record_time;
 
-    private function __construct($log_file_path = null) {
-        $this->log_path = $log_file_path ? $log_file_path : ('/tmp/exectime_' . date('YmdH') . '.log');
+    private function __construct() {
         $this->last_record_time = self::now();
+        $this->log_path = '/tmp/exectime_' . date('YmdH') . '.log';
     }
 
-    public static function instance() {
-        if (empty(self::$instance)) {
-                self::$instance = new self;
-        }
-        return self::$instance;
-    }
-
-    public function start() {
-        $this->last_record_time = self::now();
+    public static function start() {
+        return new StopWatch();
     }
 
     public function record($label = '-') {
@@ -96,5 +86,59 @@ class StopWatch {
     private static function now() {
         list($usec, $sec) = explode(' ', microtime());
         return (float)($sec + $usec);
+    }
+}
+
+class LockUtil {
+    const CHECK_INTERVAL = 10;
+    const TRIAL_TIMES = 10000;
+
+    public function lock($name) {
+        $count = 0;
+        $key = "{$name}_lock";
+        while (apcu_add($key, 1, 1) !== true) {
+            if (++$count > self::TRIAL_TIMES) {
+                throw new \Exception('dead lock');
+            }
+            usleep(self::CHECK_INTERVAL);
+        }
+    }
+
+    public function unlock($name) {
+        apcu_delete("{$name}_lock");
+    }
+}
+
+class CacheRepository {
+    private static $data = [];
+
+    public static function get($namespace, $id = null) {
+        $key = self::key($namespace, $id);
+        if (array_key_exists($key, self::$data)) {
+            return self::$data[$key];
+        }
+        if (apcu_exists($key)) {
+            return self::$data[$key] = apcu_fetch($key);
+        }
+        return null;
+    }
+
+    public static function save($value, $namespace, $id = null) {
+        $key = self::key($namespace, $id);
+        apcu_store($key, $value);
+        self::$data[$key] = $value;
+    }
+
+    public static function delete($namespace, $id = null) {
+        $key = self::key($namespace, $id);
+        unset(self::$data[$key]);
+        apcu_delete($key);
+    }
+
+    private static function key($namespace, $id = null) {
+        if ($id === null) {
+            return $namespace;
+        }
+        return "{$namespace}_{$id}";
     }
 }
