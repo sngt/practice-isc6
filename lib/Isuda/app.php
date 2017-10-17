@@ -7,6 +7,7 @@ use PDO;
 use PDOWrapper;
 use StopWatch;
 use LockUtil;
+use CacheRepository;
 
 function config($key) {
     static $conf;
@@ -44,18 +45,18 @@ $container = new class extends \Slim\Container {
     }
 
     public function get_entry_index() {
-        return apcu_fetch('entry_index') ?: [];
+        return CacheRepository::get('entry_index') ?: [];
     }
 
     public function get_entry($keyword) {
-        return apcu_fetch("entry_{$keyword}") ?: null;
+        return CacheRepository::get('entry', $keyword) ?: null;
     }
 
     public function get_all_keyword_regexps() {
         // $keywords = $this->dbh->select_all(
         //     'SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC'
         // );
-        if ($cached = apcu_fetch('all_keyword_regexp_list')) {
+        if ($cached = CacheRepository::get('all_keyword_regexp_list')) {
             return $cached;
         }
 
@@ -71,7 +72,7 @@ $container = new class extends \Slim\Container {
             $regexps[] = "/($re)/";
         }
 
-        apcu_store('all_keyword_regexp_list', $regexps);
+        CacheRepository::save($regexps, 'all_keyword_regexp_list');
         return $regexps;
     }
 
@@ -83,7 +84,7 @@ $container = new class extends \Slim\Container {
                 unset($index[$keyword]);
             }
             $index[$keyword] = 1;
-            apcu_store('entry_index', $index);
+            CacheRepository::save($index, 'entry_index');
 
             $entry = $this->get_entry($keyword);
             if (empty($entry)) {
@@ -93,7 +94,7 @@ $container = new class extends \Slim\Container {
                     'stars' => [],
                 ];
             }
-            apcu_store("entry_{$keyword}", $entry);
+            CacheRepository::save($entry, 'entry', $keyword);
         } finally {
             LockUtil::unlock('entry');
         }
@@ -108,7 +109,7 @@ $container = new class extends \Slim\Container {
             }
 
             unset($index[$keyword]);
-            apcu_store('entry_index', $index);
+            CacheRepository::save($index, 'entry_index');
             return true;
         } finally {
             LockUtil::unlock('entry');
@@ -157,6 +158,7 @@ $container = new class extends \Slim\Container {
             }
             $entry['stars'][] = ['keyword' => $keyword, 'user_name' => $user_name];
             apcu_store($cache_key, $entry);
+            CacheRepository::save($entry, 'entry', $keyword);
             return true;
         } finally {
             LockUtil::unlock($cache_key);
@@ -164,11 +166,11 @@ $container = new class extends \Slim\Container {
     }
 
     public function get_user($id) {
-        return apcu_fetch("user_id_{$id}") ?: null;
+        return CacheRepository::get('user_id', $id) ?: null;
     }
 
     public function get_user_by_name($name) {
-        return apcu_fetch("user_name_{$name}") ?: null;
+        return CacheRepository::get('user_name', $name) ?: null;
     }
 
     public function initialize() {
@@ -183,8 +185,8 @@ $container = new class extends \Slim\Container {
     private function initialize_users() {
         $users = $this->dbh->select_all('SELECT id, name, salt, password FROM user ORDER BY id');
         foreach ($users as $user) {
-            apcu_store("user_id_{$user['id']}", $user);
-            apcu_store("user_name_{$user['name']}", $user);
+            CacheRepository::save($user, 'user_id', $user['id']);
+            CacheRepository::save($user, 'user_name', $user['name']);
         }
     }
 
@@ -202,9 +204,9 @@ $container = new class extends \Slim\Container {
                 unset($entry['id']);
 
                 $entry['stars'] = [];
-                apcu_store("entry_{$entry['keyword']}", $entry);
+                CacheRepository::save($entry, 'entry', $entry['keyword']);
             }
-            apcu_store('entry_index', $index);
+            CacheRepository::save($index, 'entry_index');
         } finally {
             LockUtil::unlock('entry');
         }
@@ -353,7 +355,7 @@ $app->post('/save-keyword-internal', function (Request $req, Response $c) {
         'INSERT INTO entry (author_id, keyword, keyword_length, description, html, created_at, updated_at)'
         .' VALUES (?, ?, CHAR_LENGTH(keyword), ?, ?, NOW(), NOW())'
     , $user_id, $keyword, $description, $html);
-    apcu_delete('all_keyword_regexp_list');
+    CacheRepository::delete('all_keyword_regexp_list');
 
     // $this->dbh->query(
     //     'INSERT INTO entry (author_id, keyword, description, created_at, updated_at)'
