@@ -64,15 +64,18 @@ function render_json(\Slim\Http\Response $r, $object) {
 
 class StopWatch {
     private $log_path;
+    private $output_cycle;
     private $last_record_time;
 
-    private function __construct() {
+    private function __construct($output_cycle) {
+        $this->output_cycle = $output_cycle;
+
         $this->last_record_time = self::now();
         $this->log_path = '/tmp/exectime_' . date('YmdH') . '.log';
     }
 
-    public static function start() {
-        return new StopWatch();
+    public static function start($output_cycle = 0) {
+        return new self($output_cycle);
     }
 
     public function record($label = '-') {
@@ -80,6 +83,9 @@ class StopWatch {
         $elapsed = $now - $this->last_record_time;
         $this->last_record_time = $now;
 
+        if ($this->output_cycle > 0 && ((int)$now) % $this->output_cycle !== 0) {
+            return;
+        }
         file_put_contents($this->log_path, "{$label} : {$elapsed}\n", FILE_APPEND);
     }
 
